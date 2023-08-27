@@ -1,2 +1,2 @@
 # AcademicArticles
-Academic articles I share on LinkedIn that are behind paywalls or other difficult to access mediums. 
+Sharing academic articles on LinkedIn can be challenging when they are inaccessible due to paywalls or other barriers. However, finding ways to share such articles with others can be beneficial for promoting knowledge and advancing research in various fields. 
