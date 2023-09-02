@@ -1,2 +1,9 @@
 # LinkedIn Learning Journey
-Sharing academic articles on LinkedIn can be challenging when they are inaccessible due to paywalls or other barriers. However, finding ways to share such articles with others can be beneficial for promoting knowledge and advancing research in various fields. 
+This repository aims to collect and share articles leveraging open-source time series forecasting packages for peer-reviewed research. The goal is to provide a centralized resource highlighting open-source software's power and flexibility in research.
+
+# Scope
+This repository focuses specifically on:
+
+Time Series Forecasting
+Open-Source Software Packages
+Peer-Reviewed Research Articles
