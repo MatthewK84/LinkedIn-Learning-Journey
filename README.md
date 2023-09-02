@@ -4,6 +4,6 @@ This repository aims to collect and share articles leveraging open-source time s
 # Scope
 This repository focuses specifically on:
 
-Time Series Forecasting
-Open-Source Software Packages
-Peer-Reviewed Research Articles
+1. Time Series Forecasting
+2. Open-Source Software Packages
+3. Peer-Reviewed Research Articles
