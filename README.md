@@ -7,3 +7,7 @@ This repository focuses specifically on:
 1. Time Series Forecasting
 2. Open-Source Software Packages
 3. Peer-Reviewed Research Articles
+
+If you want to sample a GPT created for generating time series forecasting knowledge (Text Knowledge), check out the following link- https://chat.openai.com/g/g-1RLQwbs2J-forecasting-gpt 
+
+If you want to access the Beta of a powerful Time Series Analysis tool, check out the awesome folks at Nixtla and TimeGPT- https://docs.nixtla.io/ 
