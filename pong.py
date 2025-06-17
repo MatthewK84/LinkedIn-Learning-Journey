@@ -1,5 +1,6 @@
 import pygame
 import random
+import sys
 
 # Initialize Pygame
 pygame.init()
@@ -7,155 +8,249 @@ pygame.init()
 # Set up the display
 WIDTH, HEIGHT = 800, 600
 win = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Pong")
+pygame.display.set_caption("Pong Game")
 
 # Set colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
+GREEN = (0, 255, 0)
 
-# Paddle class
+# Game settings
+FPS = 60
+PADDLE_SPEED = 7
+BALL_SPEED = 5
+AI_SPEED = 5
+WINNING_SCORE = 5
+
 class Paddle:
-    WIDTH, HEIGHT = 20, 100
-    
     def __init__(self, x, y):
-        self.x = self.original_x = x
-        self.y = self.original_y = y
-        self.rect = pygame.Rect(x, y, self.WIDTH, self.HEIGHT)
+        self.width = 20
+        self.height = 100
+        self.x = x
+        self.y = y
+        self.speed = PADDLE_SPEED
+        self.rect = pygame.Rect(x, y, self.width, self.height)
 
     def draw(self, win):
         pygame.draw.rect(win, WHITE, self.rect)
 
-    def move(self, y):
-        self.y = y
-        self.rect.y = y
+    def move_up(self):
+        if self.y > 0:
+            self.y -= self.speed
+            self.rect.y = self.y
 
-# Initialize paddles
-player = Paddle(50, HEIGHT // 2 - Paddle.HEIGHT // 2)
-opponent = Paddle(WIDTH - 50 - Paddle.WIDTH, HEIGHT // 2 - Paddle.HEIGHT // 2)
+    def move_down(self):
+        if self.y + self.height < HEIGHT:
+            self.y += self.speed
+            self.rect.y = self.y
 
-# Ball class
-class Ball:
-    MAX_VEL = 5
-    RADIUS = 15
-
-    def __init__(self, x, y):
-        self.x = self.original_x = x
-        self.y = self.original_y = y
-        self.rect = pygame.Rect(x - self.RADIUS, y - self.RADIUS, self.RADIUS*2, self.RADIUS*2)
-        self.x_vel = self.MAX_VEL
-        self.y_vel = random.choice([-self.MAX_VEL, self.MAX_VEL])
-
-    def draw(self, win):
-        pygame.draw.circle(win, WHITE, (self.x, self.y), self.RADIUS)
-
-    def move(self):
-        self.x += self.x_vel
-        self.y += self.y_vel
-        self.rect.x = self.x
+    def reset_position(self):
+        self.y = HEIGHT // 2 - self.height // 2
         self.rect.y = self.y
 
-# Initialize ball
-ball = Ball(WIDTH // 2, HEIGHT // 2)
+class Ball:
+    def __init__(self, x, y):
+        self.radius = 15
+        self.x = x
+        self.y = y
+        self.speed_x = BALL_SPEED
+        self.speed_y = random.choice([-BALL_SPEED//2, BALL_SPEED//2])
+        self.rect = pygame.Rect(x - self.radius, y - self.radius, 
+                               self.radius * 2, self.radius * 2)
 
-def handle_paddle_movement(paddle):
-    keys = pygame.key.get_pressed()
-    if keys[pygame.K_UP] and paddle.y - paddle.HEIGHT // 2 > 0:
-        paddle.move(paddle.y - 4)
-    if keys[pygame.K_DOWN] and paddle.y + paddle.HEIGHT // 2 < HEIGHT:
-        paddle.move(paddle.y + 4)
+    def draw(self, win):
+        pygame.draw.circle(win, WHITE, (int(self.x), int(self.y)), self.radius)
 
-# Call handle_paddle_movement function
-handle_paddle_movement(player)
-handle_paddle_movement(opponent)
+    def move(self):
+        self.x += self.speed_x
+        self.y += self.speed_y
+        
+        # Update rect position
+        self.rect.center = (int(self.x), int(self.y))
 
-def handle_ball_movement(ball, player, opponent):
-    ball.move()
+    def bounce_y(self):
+        self.speed_y *= -1
 
-    # Ball collision with top and bottom
-    if ball.y + ball.RADIUS >= HEIGHT or ball.y - ball.RADIUS <= 0:
-        ball.y_vel *= -1
+    def bounce_x(self):
+        self.speed_x *= -1
+        # Slightly increase speed after each hit (max speed limit)
+        if abs(self.speed_x) < 8:
+            if self.speed_x > 0:
+                self.speed_x += 0.5
+            else:
+                self.speed_x -= 0.5
 
-    # Ball collision with paddles
-    if ball.rect.colliderect(player.rect) or ball.rect.colliderect(opponent.rect):
-        ball.x_vel *= -1
+    def reset(self):
+        self.x = WIDTH // 2
+        self.y = HEIGHT // 2
+        self.speed_x = BALL_SPEED if random.choice([True, False]) else -BALL_SPEED
+        self.speed_y = random.choice([-BALL_SPEED//2, BALL_SPEED//2])
+        self.rect.center = (int(self.x), int(self.y))
 
-    # Score updates and resetting ball
-    if ball.x < 0:
-        # Opponent scores
-        ball.__init__(WIDTH // 2, HEIGHT // 2)
-    elif ball.x > WIDTH:
-        # Player scores
-        ball.__init__(WIDTH // 2, HEIGHT // 2)
+    def check_wall_collision(self):
+        # Top and bottom walls
+        if self.y - self.radius <= 0 or self.y + self.radius >= HEIGHT:
+            self.bounce_y()
 
-def draw(win, player, opponent, ball):
-    win.fill(BLACK)
-    player.draw(win)
-    opponent.draw(win)
-    ball.draw(win)
-    pygame.display.update()
+    def check_paddle_collision(self, paddle):
+        if self.rect.colliderect(paddle.rect):
+            # Calculate where ball hit the paddle (for angle variation)
+            hit_pos = (self.y - paddle.y) / paddle.height
+            self.speed_y = (hit_pos - 0.5) * 8  # Adjust angle based on hit position
+            self.bounce_x()
+            
+            # Move ball slightly away from paddle to prevent sticking
+            if self.speed_x > 0:
+                self.x = paddle.rect.left - self.radius - 1
+            else:
+                self.x = paddle.rect.right + self.radius + 1
 
-    # Score variables
-player_score = 0
-opponent_score = 0
-font = pygame.font.SysFont("comicsans", 50)
+class Game:
+    def __init__(self):
+        self.player_score = 0
+        self.ai_score = 0
+        self.font = pygame.font.Font(None, 74)
+        self.small_font = pygame.font.Font(None, 36)
+        self.clock = pygame.time.Clock()
+        
+        # Initialize game objects
+        self.player = Paddle(50, HEIGHT // 2 - 50)
+        self.ai = Paddle(WIDTH - 70, HEIGHT // 2 - 50)
+        self.ball = Ball(WIDTH // 2, HEIGHT // 2)
+        
+        self.game_over = False
+        self.winner = ""
 
-def draw(win, paddles, ball, player_score, opponent_score):
-    win.fill(BLACK)
-    
-    # Draw paddles, ball, and scores
-    for paddle in paddles:
-        paddle.draw(win)
-    ball.draw(win)
-
-    player_score_text = font.render(f"{player_score}", 1, WHITE)
-    opponent_score_text = font.render(f"{opponent_score}", 1, WHITE)
-    win.blit(player_score_text, (WIDTH//4 - player_score_text.get_width()//2, 20))
-    win.blit(opponent_score_text, (WIDTH * (3/4) - opponent_score_text.get_width()//2, 20))
-
-    pygame.display.update()
-
-    def main():
-        global player_score, opponent_score
-
-        clock = pygame.time.Clock()
-
-    clock = pygame.time.Clock()
-
-    run = True
-    while run:
-        clock.tick(60)  # 60 FPS
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                run = False
-                break
-
+    def handle_player_input(self):
         keys = pygame.key.get_pressed()
-        handle_paddle_movement(keys, player)
-        handle_ball_movement(ball, player, opponent)
-        draw(win, [player, opponent], ball, player_score, opponent_score)
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            self.player.move_up()
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            self.player.move_down()
 
-    pygame.quit()
+    def update_ai(self):
+        # Simple AI that follows the ball
+        paddle_center = self.ai.y + self.ai.height // 2
+        
+        if paddle_center < self.ball.y - 30:
+            if self.ai.y + self.ai.height < HEIGHT:
+                self.ai.y += AI_SPEED
+                self.ai.rect.y = self.ai.y
+        elif paddle_center > self.ball.y + 30:
+            if self.ai.y > 0:
+                self.ai.y -= AI_SPEED
+                self.ai.rect.y = self.ai.y
 
+    def update_ball(self):
+        if not self.game_over:
+            self.ball.move()
+            self.ball.check_wall_collision()
+            self.ball.check_paddle_collision(self.player)
+            self.ball.check_paddle_collision(self.ai)
+
+            # Check for scoring
+            if self.ball.x < 0:
+                self.ai_score += 1
+                self.ball.reset()
+                if self.ai_score >= WINNING_SCORE:
+                    self.game_over = True
+                    self.winner = "AI Wins!"
+                    
+            elif self.ball.x > WIDTH:
+                self.player_score += 1
+                self.ball.reset()
+                if self.player_score >= WINNING_SCORE:
+                    self.game_over = True
+                    self.winner = "Player Wins!"
+
+    def draw_dashed_line(self):
+        # Draw center line
+        for i in range(0, HEIGHT, 20):
+            if i % 40 == 0:
+                pygame.draw.rect(win, WHITE, (WIDTH//2 - 2, i, 4, 15))
+
+    def draw_scores(self):
+        player_text = self.font.render(str(self.player_score), True, WHITE)
+        ai_text = self.font.render(str(self.ai_score), True, WHITE)
+        
+        win.blit(player_text, (WIDTH//4 - player_text.get_width()//2, 50))
+        win.blit(ai_text, (3*WIDTH//4 - ai_text.get_width()//2, 50))
+
+    def draw_instructions(self):
+        if not self.game_over:
+            inst_text = self.small_font.render("Use ↑↓ or W/S keys to move", True, WHITE)
+            win.blit(inst_text, (WIDTH//2 - inst_text.get_width()//2, HEIGHT - 40))
+
+    def draw_game_over(self):
+        if self.game_over:
+            # Semi-transparent overlay
+            overlay = pygame.Surface((WIDTH, HEIGHT))
+            overlay.set_alpha(128)
+            overlay.fill(BLACK)
+            win.blit(overlay, (0, 0))
+            
+            # Winner text
+            winner_text = self.font.render(self.winner, True, GREEN)
+            win.blit(winner_text, (WIDTH//2 - winner_text.get_width()//2, HEIGHT//2 - 50))
+            
+            # Restart instruction
+            restart_text = self.small_font.render("Press SPACE to play again or ESC to quit", True, WHITE)
+            win.blit(restart_text, (WIDTH//2 - restart_text.get_width()//2, HEIGHT//2 + 20))
+
+    def reset_game(self):
+        self.player_score = 0
+        self.ai_score = 0
+        self.game_over = False
+        self.winner = ""
+        self.player.reset_position()
+        self.ai.reset_position()
+        self.ball.reset()
+
+    def draw(self):
+        win.fill(BLACK)
+        
+        # Draw game elements
+        self.draw_dashed_line()
+        self.player.draw(win)
+        self.ai.draw(win)
+        self.ball.draw(win)
+        self.draw_scores()
+        self.draw_instructions()
+        self.draw_game_over()
+        
+        pygame.display.flip()
+
+    def run(self):
+        running = True
+        
+        while running:
+            self.clock.tick(FPS)
+            
+            # Handle events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_SPACE and self.game_over:
+                        self.reset_game()
+            
+            # Update game state
+            if not self.game_over:
+                self.handle_player_input()
+                self.update_ai()
+                self.update_ball()
+            
+            # Draw everything
+            self.draw()
+        
+        pygame.quit()
+        sys.exit()
 
 def main():
-    global player_score, opponent_score
-
-    clock = pygame.time.Clock()
-
-    run = True
-    while run:
-        clock.tick(60)  # 60 FPS
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                run = False
-                break
-
-        keys = pygame.key.get_pressed()
-        handle_paddle_movement(keys, player)
-        handle_ball_movement(ball, player, opponent)
-        draw(win, [player, opponent], ball, player_score, opponent_score)
+    game = Game()
+    game.run()
 
 if __name__ == "__main__":
     main()
-
-# Path: pong.py
