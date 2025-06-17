@@ -19,7 +19,7 @@ GREEN = (0, 255, 0)
 FPS = 60
 PADDLE_SPEED = 7
 BALL_SPEED = 5
-AI_SPEED = 5
+AI_SPEED = 4
 WINNING_SCORE = 5
 
 class Paddle:
@@ -29,34 +29,36 @@ class Paddle:
         self.x = x
         self.y = y
         self.speed = PADDLE_SPEED
-        self.rect = pygame.Rect(x, y, self.width, self.height)
 
     def draw(self, win):
-        pygame.draw.rect(win, WHITE, self.rect)
+        pygame.draw.rect(win, WHITE, (self.x, self.y, self.width, self.height))
 
     def move_up(self):
         if self.y > 0:
             self.y -= self.speed
-            self.rect.y = self.y
 
     def move_down(self):
         if self.y + self.height < HEIGHT:
             self.y += self.speed
-            self.rect.y = self.y
+
+    def get_rect(self):
+        return pygame.Rect(self.x, self.y, self.width, self.height)
 
     def reset_position(self):
         self.y = HEIGHT // 2 - self.height // 2
-        self.rect.y = self.y
 
 class Ball:
     def __init__(self, x, y):
         self.radius = 15
-        self.x = x
-        self.y = y
-        self.speed_x = BALL_SPEED
-        self.speed_y = random.choice([-BALL_SPEED//2, BALL_SPEED//2])
-        self.rect = pygame.Rect(x - self.radius, y - self.radius, 
-                               self.radius * 2, self.radius * 2)
+        self.reset_position()
+        
+    def reset_position(self):
+        self.x = WIDTH // 2
+        self.y = HEIGHT // 2
+        # Random initial direction
+        direction = random.choice([-1, 1])
+        self.speed_x = BALL_SPEED * direction
+        self.speed_y = random.uniform(-3, 3)
 
     def draw(self, win):
         pygame.draw.circle(win, WHITE, (int(self.x), int(self.y)), self.radius)
@@ -64,46 +66,46 @@ class Ball:
     def move(self):
         self.x += self.speed_x
         self.y += self.speed_y
-        
-        # Update rect position
-        self.rect.center = (int(self.x), int(self.y))
 
-    def bounce_y(self):
-        self.speed_y *= -1
-
-    def bounce_x(self):
-        self.speed_x *= -1
-        # Slightly increase speed after each hit (max speed limit)
-        if abs(self.speed_x) < 8:
-            if self.speed_x > 0:
-                self.speed_x += 0.5
-            else:
-                self.speed_x -= 0.5
-
-    def reset(self):
-        self.x = WIDTH // 2
-        self.y = HEIGHT // 2
-        self.speed_x = BALL_SPEED if random.choice([True, False]) else -BALL_SPEED
-        self.speed_y = random.choice([-BALL_SPEED//2, BALL_SPEED//2])
-        self.rect.center = (int(self.x), int(self.y))
+    def get_rect(self):
+        return pygame.Rect(self.x - self.radius, self.y - self.radius, 
+                          self.radius * 2, self.radius * 2)
 
     def check_wall_collision(self):
         # Top and bottom walls
-        if self.y - self.radius <= 0 or self.y + self.radius >= HEIGHT:
-            self.bounce_y()
+        if self.y - self.radius <= 0:
+            self.y = self.radius
+            self.speed_y = abs(self.speed_y)
+        elif self.y + self.radius >= HEIGHT:
+            self.y = HEIGHT - self.radius
+            self.speed_y = -abs(self.speed_y)
 
     def check_paddle_collision(self, paddle):
-        if self.rect.colliderect(paddle.rect):
-            # Calculate where ball hit the paddle (for angle variation)
-            hit_pos = (self.y - paddle.y) / paddle.height
-            self.speed_y = (hit_pos - 0.5) * 8  # Adjust angle based on hit position
-            self.bounce_x()
+        ball_rect = self.get_rect()
+        paddle_rect = paddle.get_rect()
+        
+        if ball_rect.colliderect(paddle_rect):
+            # Determine which side of paddle was hit
+            ball_center_x = self.x
+            paddle_center_x = paddle.x + paddle.width // 2
             
-            # Move ball slightly away from paddle to prevent sticking
-            if self.speed_x > 0:
-                self.x = paddle.rect.left - self.radius - 1
-            else:
-                self.x = paddle.rect.right + self.radius + 1
+            # Calculate relative position on paddle (0 to 1)
+            relative_intersect_y = (self.y - (paddle.y + paddle.height // 2)) / (paddle.height // 2)
+            
+            # Reverse horizontal direction
+            self.speed_x = -self.speed_x
+            
+            # Adjust vertical speed based on where ball hit paddle
+            self.speed_y = relative_intersect_y * 5
+            
+            # Move ball away from paddle to prevent sticking
+            if ball_center_x < paddle_center_x:  # Ball hit left side
+                self.x = paddle.x - self.radius - 1
+            else:  # Ball hit right side
+                self.x = paddle.x + paddle.width + self.radius + 1
+            
+            return True
+        return False
 
 class Game:
     def __init__(self):
@@ -129,36 +131,42 @@ class Game:
             self.player.move_down()
 
     def update_ai(self):
-        # Simple AI that follows the ball
+        # Simple AI that follows the ball with some delay
         paddle_center = self.ai.y + self.ai.height // 2
         
-        if paddle_center < self.ball.y - 30:
-            if self.ai.y + self.ai.height < HEIGHT:
+        # Only move if ball is moving towards AI
+        if self.ball.speed_x > 0:
+            if paddle_center < self.ball.y - 20:
                 self.ai.y += AI_SPEED
-                self.ai.rect.y = self.ai.y
-        elif paddle_center > self.ball.y + 30:
-            if self.ai.y > 0:
+            elif paddle_center > self.ball.y + 20:
                 self.ai.y -= AI_SPEED
-                self.ai.rect.y = self.ai.y
+        
+        # Keep AI paddle within bounds
+        if self.ai.y < 0:
+            self.ai.y = 0
+        elif self.ai.y + self.ai.height > HEIGHT:
+            self.ai.y = HEIGHT - self.ai.height
 
     def update_ball(self):
         if not self.game_over:
             self.ball.move()
             self.ball.check_wall_collision()
+            
+            # Check paddle collisions
             self.ball.check_paddle_collision(self.player)
             self.ball.check_paddle_collision(self.ai)
 
             # Check for scoring
-            if self.ball.x < 0:
+            if self.ball.x < -20:  # Player missed
                 self.ai_score += 1
-                self.ball.reset()
+                self.ball.reset_position()
                 if self.ai_score >= WINNING_SCORE:
                     self.game_over = True
                     self.winner = "AI Wins!"
                     
-            elif self.ball.x > WIDTH:
+            elif self.ball.x > WIDTH + 20:  # AI missed
                 self.player_score += 1
-                self.ball.reset()
+                self.ball.reset_position()
                 if self.player_score >= WINNING_SCORE:
                     self.game_over = True
                     self.winner = "Player Wins!"
@@ -204,7 +212,7 @@ class Game:
         self.winner = ""
         self.player.reset_position()
         self.ai.reset_position()
-        self.ball.reset()
+        self.ball.reset_position()
 
     def draw(self):
         win.fill(BLACK)
@@ -249,8 +257,13 @@ class Game:
         sys.exit()
 
 def main():
-    game = Game()
-    game.run()
+    try:
+        game = Game()
+        game.run()
+    except Exception as e:
+        print(f"Error running game: {e}")
+        pygame.quit()
+        sys.exit()
 
 if __name__ == "__main__":
     main()
