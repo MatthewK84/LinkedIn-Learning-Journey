@@ -293,7 +293,7 @@ Where $H_k = D \cdot B \cdot W_k$ combines:
 
 Reconstruct $x$ by minimizing:
 
-$$\hat{x} = \arg\min_x \left\{ \sum_{k=1}^{K} \|y_k - H_k x\|^2 + \lambda \cdot R(x) \right\}$$
+$$\hat{x} = \arg\min_x \left\lbrace \sum_{k=1}^{K} \|y_k - H_k x\|^2 + \lambda \cdot R(x) \right\rbrace$$
 
 Where:
 - First term: data fidelity.
