@@ -172,7 +172,7 @@ Diffraction-limited MTF for a circular aperture:
 $$\text{MTF}_{\text{diff}}(\nu) = \frac{2}{\pi}\left[\cos^{-1}\left(\frac{\nu}{\nu_c}\right) - \frac{\nu}{\nu_c}\sqrt{1 - \left(\frac{\nu}{\nu_c}\right)^2}\right]$$
 
 Where cutoff frequency:
-$$\nu_c = \frac{D}{\lambda \cdot f} = \frac{1}{\lambda \cdot F/\#}$$
+$$\nu_c = \frac{D}{\lambda \cdot f} = \frac{1}{\lambda \cdot F/\}$$
 
 For f/4 at λ = 4.0 µm (mid-MWIR):
 $$\nu_c = \frac{1}{4.0 \mu m \times 4} = 62.5 \text{ cycles/mm}$$
