@@ -1,6 +1,6 @@
 # Multi-Frame Super-Resolution for MWIR Aerial Imaging
 
-## Mathematical Recovery Process for Target Identification at 8,000 ft AGL
+## Mathematical Recovery Process for Object Identification at 8,000 ft AGL
 
 ### Teledyne FLIR Neutrino LC – CZ 15-300
 
@@ -37,9 +37,9 @@
 
 ## 2. Problem Statement
 
-**Objective**: Achieve reliable target identification from 8,000 ft AGL (2,438 m slant range) using multi-frame super-resolution to computationally enhance the native sensor resolution.
+**Objective**: Achieve reliable object identification from 8,000 ft AGL (2,438 m slant range) using multi-frame super-resolution to computationally enhance the native sensor resolution.
 
-**Key Question**: Can we reliably identify targets (vehicles, persons, objects) at 8,000 ft when the native optical resolution may be insufficient?
+**Question**: Can we reliably identify targets (vehicles, persons, objects) at 8,000 ft when the native optical resolution may be insufficient?
 
 ---
 
@@ -107,36 +107,36 @@ $$\text{Pixels Required} = 6.4 \times 2.5 = 16 \text{ pixels across target}$$
 | 200 mm | 18.3 | 10.9 | Marginal |
 | 300 mm | 12.2 | 16.4 | Yes |
 
-**Critical Finding**: At 8,000 ft AGL with native resolution, full zoom (300mm) is required for vehicle identification. Super-resolution can relax this requirement.
+**Finding**: At 8,000 ft AGL with native resolution, full zoom (300mm) is required for vehicle identification. Super-resolution can relax this requirement.
 
 ---
 
 ## 4. Super-Resolution Theory
 
-### 4.1 Fundamental Principle
+### 4.1 Fundamentals
 
 Multi-frame super-resolution exploits sub-pixel shifts between frames to reconstruct a higher-resolution image than any single frame contains.
 
-Given $K$ low-resolution frames $\{y_1, y_2, ..., y_K\}$, each related to the high-resolution image $x$ by:
+Given $K$ low-resolution frames $\{y_1, y_2, y_K\}$, each related to the high-resolution image $x$ by:
 
 $$y_k = D \cdot B \cdot M_k \cdot x + n_k$$
 
 Where:
-- $D$ = decimation (downsampling) matrix
-- $B$ = blur kernel (optical PSF + motion blur)
-- $M_k$ = motion/warp matrix for frame $k$
-- $n_k$ = noise in frame $k$
+- $D$ = decimation (downsampling) matrix.
+- $B$ = blur kernel (optical PSF + motion blur).
+- $M_k$ = motion/warp matrix for frame $k$.
+- $n_k$ = noise in frame $k$.
 
-### 4.2 Information-Theoretic Basis
+### 4.2 Information Theoretic Basis
 
-The achievable resolution gain depends on:
+Achievable resolution gain depends on:
 
-1. **Sub-pixel shift diversity**: Frames must sample different phase positions
-2. **Signal-to-noise ratio**: Higher SNR enables more aggressive reconstruction
-3. **Number of frames**: More frames provide more constraints
-4. **Motion model accuracy**: Errors in $M_k$ create artifacts
+1. **Sub-pixel shift diversity**: Frames must sample different phase positions.
+2. **Signal-to-noise ratio**: Higher SNR enables more aggressive reconstruction.
+3. **Number of frames**: More frames provide more constraints.
+4. **Motion model accuracy**: Errors in $M_k$ create artifacts.
 
-**Theoretical Maximum Gain**: For $K$ frames with uniformly distributed sub-pixel shifts:
+**Maximum Gain**: For $K$ frames with uniformly distributed sub-pixel shifts:
 
 $$\text{Resolution Gain} \leq \sqrt{K}$$
 
@@ -149,9 +149,9 @@ The minimum variance achievable for super-resolution estimation:
 $$\text{Var}(\hat{x}) \geq \frac{\sigma_n^2}{K \cdot \text{MTF}^2(f)}$$
 
 Where:
-- $\sigma_n^2$ = noise variance
-- $K$ = number of frames
-- $\text{MTF}(f)$ = system modulation transfer function at spatial frequency $f$
+- $\sigma_n^2$ = noise variance.
+- $K$ = number of frames.
+- $\text{MTF}(f)$ = system modulation transfer function at spatial frequency $f$.
 
 This bounds the achievable resolution enhancement for a given noise level and frame count.
 
@@ -172,7 +172,7 @@ Diffraction-limited MTF for a circular aperture:
 $$\text{MTF}_{\text{diff}}(\nu) = \frac{2}{\pi}\left[\cos^{-1}\left(\frac{\nu}{\nu_c}\right) - \frac{\nu}{\nu_c}\sqrt{1 - \left(\frac{\nu}{\nu_c}\right)^2}\right]$$
 
 Where cutoff frequency:
-$$\nu_c = \frac{D}{\lambda \cdot f} = \frac{1}{\lambda \cdot F/\}$$
+$$\nu_c = \frac{D}{\lambda \cdot f} = \frac{1}{\lambda \cdot F/}$$
 
 For f/4 at λ = 4.0 µm (mid-MWIR):
 $$\nu_c = \frac{1}{4.0 \mu m \times 4} = 62.5 \text{ cycles/mm}$$
@@ -200,9 +200,9 @@ Where $r_0$ is the Fried parameter (atmospheric coherence length).
 $$r_0 = \left[0.423 \cdot k^2 \cdot \sec(\zeta) \cdot \int_0^L C_n^2(z) \, dz\right]^{-3/5}$$
 
 Typical values:
-- Good conditions (stable atmosphere): $r_0$ = 10-20 cm
-- Moderate conditions: $r_0$ = 5-10 cm
-- Poor conditions (strong turbulence): $r_0$ = 2-5 cm
+- Good conditions (stable atmosphere): $r_0$ = 10-20 cm.
+- Moderate conditions: $r_0$ = 5-10 cm.
+- Poor conditions (strong turbulence): $r_0$ = 2-5 cm.
 
 ### 5.5 Motion MTF
 
@@ -211,8 +211,8 @@ For linear motion during exposure:
 $$\text{MTF}_{\text{motion}}(\nu) = \text{sinc}(\nu \cdot v \cdot t_{exp})$$
 
 Where:
-- $v$ = angular velocity (rad/s)
-- $t_{exp}$ = exposure time
+- $v$ = angular velocity (rad/s).
+- $t_{exp}$ = exposure time.
 
 **Design Rule**: Keep motion blur < 0.5 pixels during exposure.
 
@@ -233,9 +233,9 @@ Platform motion between frames consists of:
 $$\mathbf{M}_k = \mathbf{R}(\theta_k) \cdot \mathbf{T}(t_k) + \mathbf{v}_k$$
 
 Where:
-- $\mathbf{R}(\theta_k)$ = rotation matrix (roll, pitch, yaw)
-- $\mathbf{T}(t_k)$ = translation vector
-- $\mathbf{v}_k$ = residual vibration/jitter
+- $\mathbf{R}(\theta_k)$ = rotation matrix (roll, pitch, yaw).
+- $\mathbf{T}(t_k)$ = translation vector.
+- $\mathbf{v}_k$ = residual vibration/jitter.
 
 ### 6.2 IMU Integration
 
@@ -253,16 +253,16 @@ Where $[\boldsymbol{\theta}]_\times$ is the skew-symmetric matrix of $\boldsymbo
 
 ### 6.3 Image-to-IMU Alignment Refinement
 
-IMU provides initial estimate; image-based refinement corrects residual errors.
+IMU provides an initial estimate; image-based refinement corrects residual errors.
 
-**Optimization objective**:
+**Objective**:
 
 $$\hat{\mathbf{M}}_k = \arg\min_{\mathbf{M}_k} \sum_i \rho\left(\|I_k(\mathbf{M}_k \cdot \mathbf{p}_i) - I_{ref}(\mathbf{p}_i)\|^2\right)$$
 
 Where:
-- $I_k$, $I_{ref}$ = frame $k$ and reference frame
-- $\mathbf{p}_i$ = feature/pixel locations
-- $\rho(\cdot)$ = robust loss function (Huber, Cauchy)
+- $I_k$, $I_{ref}$ = frame $k$ and reference frame.
+- $\mathbf{p}_i$ = feature/pixel locations.
+- $\rho(\cdot)$ = robust loss function (Huber, Cauchy).
 
 ### 6.4 Time Synchronization Requirements
 
@@ -285,9 +285,9 @@ The imaging process maps high-resolution scene $x$ to observed frames $\{y_k\}$:
 $$y_k = H_k x + n_k$$
 
 Where $H_k = D \cdot B \cdot W_k$ combines:
-- $W_k$ = warp/motion operator for frame $k$
-- $B$ = blur operator (PSF)
-- $D$ = downsampling operator
+- $W_k$ = warp/motion operator for frame $k$.
+- $B$ = blur operator (PSF).
+- $D$ = downsampling operator.
 
 ### 7.2 Maximum A Posteriori (MAP) Estimation
 
@@ -296,9 +296,9 @@ Reconstruct $x$ by minimizing:
 $$\hat{x} = \arg\min_x \left\{ \sum_{k=1}^{K} \|y_k - H_k x\|^2 + \lambda \cdot R(x) \right\}$$
 
 Where:
-- First term: data fidelity
-- $R(x)$: regularization prior
-- $\lambda$: regularization weight
+- First term: data fidelity.
+- $R(x)$: regularization prior.
+- $\lambda$: regularization weight.
 
 ### 7.3 Regularization Options
 
@@ -330,14 +330,14 @@ For iteration t = 1 to T:
     x⁽ᵗ⁾ = x⁽ᵗ⁻¹⁾ + β ∑_k Δx_k - λ∇R(x⁽ᵗ⁻¹⁾)   # Update with regularization
 ```
 
-**Convergence**: Typically 20-50 iterations.
+**Convergence**: 20-50 iterations.
 
 ### 7.5 Computational Complexity
 
 Per iteration:
-- Forward projection: $O(K \cdot N^2)$ where $N^2$ is HR image size
-- Back projection: $O(K \cdot N^2)$
-- Regularization gradient: $O(N^2)$
+- Forward projection: $O(K \cdot N^2)$ where $N^2$ is HR image size.
+- Back projection: $O(K \cdot N^2)$.
+- Regularization gradient: $O(N^2)$.
 
 Total: $O(T \cdot K \cdot N^2)$
 
@@ -353,9 +353,9 @@ Achievable at ~10 Hz on embedded GPU (Jetson Orin).
 ### 8.1 Turbulence Effects
 
 Atmospheric turbulence causes:
-1. **Blur**: Random wavefront distortion
-2. **Warping**: Spatially-varying image shift
-3. **Scintillation**: Intensity fluctuations
+1. **Blur**: Random wavefront distortion.
+2. **Warping**: Spatially-varying image shift.
+3. **Scintillation**: Intensity fluctuations.
 
 ### 8.2 Lucky Imaging Integration
 
@@ -364,19 +364,19 @@ Exploit temporal variation in turbulence quality:
 1. **Quality metric**: Compute sharpness metric for each frame
    $$Q_k = \sum_{i,j} |\nabla I_k(i,j)|^2$$
 
-2. **Frame selection**: Use top 10-30% highest quality frames
+2. **Frame selection**: Use the top 10-30% highest quality frames
 
 3. **Weighted fusion**: Weight frames by quality in SR reconstruction
    $$\hat{x} = \arg\min_x \sum_k w_k \|y_k - H_k x\|^2$$
 
 ### 8.3 Isoplanatic Patch Processing
 
-When field of view exceeds isoplanatic angle $\theta_0$:
+When the field of view exceeds the isoplanatic angle $\theta_0$:
 
-1. Divide image into patches smaller than $\theta_0$
-2. Estimate motion independently per patch
-3. Reconstruct patches separately
-4. Blend overlapping regions
+1. Divide the image into patches smaller than $\theta_0$.
+2. Estimate motion independently per patch.
+3. Reconstruct patches separately.
+4. Blend overlapping regions.
 
 **Isoplanatic angle estimation**:
 $$\theta_0 \approx 0.31 \frac{r_0}{h}$$
@@ -384,13 +384,13 @@ $$\theta_0 \approx 0.31 \frac{r_0}{h}$$
 For $r_0$ = 10 cm and $h$ = 2,438 m:
 $$\theta_0 \approx 12.7 \mu rad \approx 0.25 \text{ pixels at 300mm}$$
 
-This is very small—atmospheric correlation is limited at these ranges.
+This is a small atmospheric correlation limited to these ranges.
 
 ---
 
 ## 9. Implementation Pipeline
 
-### 9.1 Real-Time Architecture
+### 9.1 Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
@@ -441,7 +441,7 @@ With reliable 2× super-resolution:
 | 200 mm | 18.3 | 9.15 | 21.9 |
 | 300 mm | 12.2 | 6.1 | 32.8 |
 
-**Key Finding**: With 2× super-resolution, 150mm focal length achieves identification capability equivalent to native 300mm.
+**Finding**: With 2× super-resolution, 150mm focal length achieves identification capability equivalent to native 300mm.
 
 ### 10.2 Johnson Criteria Compliance (8,000 ft AGL, 2m Vehicle)
 
@@ -472,15 +472,15 @@ This is excellent SNR for super-resolution.
 
 ## 11. Validation Protocol
 
-### 11.1 Ground Truth Requirements
+### 11.1 Ground Truth
 
-1. **Resolution targets**: Place calibrated bar targets at known distances
-   - 4-bar MRTD targets at 8,000 ft equivalent angular size
-   - Minimum Resolvable Temperature Difference (MRTD) characterization
+1. **Resolution targets**: Place calibrated bar targets at known distances.
+   - 4-bar MRTD targets at 8,000 ft equivalent angular size.
+   - Minimum Resolvable Temperature Difference (MRTD) characterization.
 
-2. **Reference imagery**: Acquire simultaneous imagery from calibrated reference system
+2. **Reference imagery**: Acquire simultaneous imagery froa m calibrated reference system
 
-3. **Controlled motion**: Use precision gimbal to generate known sub-pixel shifts
+3. **Controlled motion**: Use a precision gimbal to generate known sub-pixel shifts
 
 ### 11.2 Metrics
 
@@ -509,39 +509,39 @@ $$G_{SR} = \frac{\text{MTF50}_{\text{enhanced}}}{\text{MTF50}_{\text{native}}}$$
 
 ### 12.1 Camera Interface
 
-- [ ] Camera Link or GigE interface configured
-- [ ] 14-bit or 16-bit raw data capture enabled
-- [ ] Hardware trigger output connected to IMU
-- [ ] NUC tables loaded and verified
-- [ ] Frame rate set to 60 Hz
+- [ ] Camera Link or GigE interface configured.
+- [ ] 14-bit or 16-bit raw data capture enabled.
+- [ ] Hardware trigger output connected to IMU.
+- [ ] NUC tables loaded and verified.
+- [ ] Frame rate set to 60 Hz.
 
 ### 12.2 IMU Requirements
 
-- [ ] Sample rate ≥ 800 Hz
-- [ ] Gyro bias stability < 1°/hr
-- [ ] Accelerometer noise < 100 µg/√Hz
-- [ ] Hardware timestamp synchronization < 1 ms
-- [ ] Rigid mounting to camera body
+- [ ] Sample rate ≥ 800 Hz.
+- [ ] Gyro bias stability < 1°/hr.
+- [ ] Accelerometer noise < 100 µg/√Hz.
+- [ ] Hardware timestamp synchronization < 1 ms.
+- [ ] Rigid mounting to camera body.
 
 ### 12.3 Processing Hardware
 
-- [ ] GPU compute capability ≥ 7.0 (Jetson Orin recommended)
-- [ ] Memory bandwidth ≥ 100 GB/s
-- [ ] Storage: NVMe SSD for raw data logging
-- [ ] Power: 25-40W budget for compute module
+- [ ] GPU compute capability ≥ 7.0 (Jetson Orin recommended).
+- [ ] Memory bandwidth ≥ 100 GB/s.
+- [ ] Storage: NVMe SSD for raw data logging.
+- [ ] Power: 25-40W budget for compute module.
 
 ### 12.4 Software Stack
 
-- [ ] CUDA/TensorRT for GPU acceleration
-- [ ] OpenCV for image processing primitives
-- [ ] Eigen for linear algebra
-- [ ] Custom SR kernel optimized for target resolution
+- [ ] CUDA/TensorRT for GPU acceleration.
+- [ ] OpenCV for image processing primitives.
+- [ ] Eigen for linear algebra.
+- [ ] Custom SR kernel optimized for target resolution.
 
 ---
 
 ## 13. Summary
 
-### 13.1 Key Parameters
+### 13.1 Parameters
 
 | Parameter | Value |
 |-----------|-------|
@@ -556,24 +556,24 @@ $$G_{SR} = \frac{\text{MTF50}_{\text{enhanced}}}{\text{MTF50}_{\text{native}}}$$
 ### 13.2 Operational Envelope
 
 **Identification Capable**:
-- Focal length ≥ 150mm with 2× super-resolution
-- Focal length ≥ 300mm without super-resolution
-- Scene ΔT ≥ 1°C for adequate SNR
-- Platform angular rate < 2°/s for motion blur control
+- Focal length ≥ 150mm with 2× super-resolution.
+- Focal length ≥ 300mm without super-resolution.
+- Scene ΔT ≥ 1°C for adequate SNR.
+- Platform angular rate < 2°/s for motion blur control.
 
 **Degraded Performance Expected**:
-- Strong atmospheric turbulence ($r_0$ < 5 cm)
-- Low scene contrast (ΔT < 0.5°C)
-- Rapid platform motion (> 5°/s)
+- Strong atmospheric turbulence ($r_0$ < 5 cm).
+- Low scene contrast (ΔT < 0.5°C).
+- Rapid platform motion (> 5°/s).
 
 ### 13.3 Workflow Summary
 
-1. **Acquire**: Capture 20-30 frames at 60 Hz (333-500 ms)
-2. **Estimate Motion**: Integrate IMU, refine with image alignment
-3. **Quality Select**: Rank frames, weight by sharpness
-4. **Reconstruct**: MAP estimation with BTV regularization (30 iterations)
-5. **Validate**: Check consistency, flag low-confidence regions
-6. **Output**: Enhanced frame at 10 Hz
+1. **Acquire**: Capture 20-30 frames at 60 Hz (333-500 ms).
+2. **Estimate Motion**: Integrate IMU, refine with image alignment.
+3. **Quality Select**: Rank frames, weight by sharpness.
+4. **Reconstruct**: MAP estimation with BTV regularization (30 iterations).
+5. **Validate**: Check consistency, flag low-confidence regions.
+6. **Output**: Enhanced frame at 10 Hz.
 
 ---
 
@@ -631,7 +631,7 @@ Recognition requires ≥ 4.0 cycles
 
 ---
 
-*Document Version: 1.0*
-*Date: December 2024*
+*Document Version: 1.1*
+*Date: December 2025*
 *Platform: Teledyne FLIR Neutrino LC – CZ 15-300 (425-0065-00)*
 *Application: High-Altitude MWIR Imaging with Computational Enhancement*
