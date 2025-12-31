@@ -39,4 +39,4 @@ Welcome to my professional journey!
 - Email: [matthew.kolakowski@yahoo.com]
 - Twitter: [@MatthewKolakow9]
 
-*Last Updated: December 2024*
+*Last Updated: December 2025*
