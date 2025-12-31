@@ -1,6 +1,6 @@
-# Robotics & UAS Engineering Master Study Guide
+# Robotics & UAS Engineering Study Guide
 
-This guide covers the full stack of robotics engineering, from the physics of hardware to high-level path planning.
+This guide covers the basics of robotics engineering.
 
 ---
 
