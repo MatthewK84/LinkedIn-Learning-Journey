@@ -1,4 +1,4 @@
-# Multi-Frame Super-Resolution for MWIR Aerial Imaging
+# MultiFrame Super Resolution for MWIR Aerial Imaging
 
 ## Mathematical Recovery Process for Target Identification at 8,000 ft AGL
 
@@ -6,14 +6,14 @@
 
 ---
 
-## Executive Summary
+## Summary
 
 This document presents a mathematical framework for achieving reliable target identification from 8,000 ft AGL using the Teledyne FLIR Neutrino LC CZ 15-300 MWIR camera with computational super-resolution enhancement.
 
 **Findings:**
 
-- Native 300mm focal length is required for vehicle identification at 8,000 ft without computational enhancement.
-- With reliable 2× super-resolution, identification capability is achieved at 150mm focal length, providing wider field of view for target acquisition.
+- A native 300mm focal length is required for vehicle identification at 8,000 ft without computational enhancement.
+- With reliable 2× super-resolution, identification capability is achieved at 150mm focal length, providing a wider field of view for target acquisition.
 - The Neutrino LC's excellent SNR (~36 dB for ΔT = 2°C scenes) supports robust super-resolution reconstruction.
 - IMU-camera synchronization better than 1 ms is required for accurate motion estimation.
 - Real-time processing at 10 Hz output is achievable on embedded GPU platforms (e.g., NVIDIA Jetson Orin).
@@ -214,7 +214,7 @@ Diffraction-limited MTF for a circular aperture follows:
 $$\text{MTF}_{\text{diff}}(\nu) = \frac{2}{\pi}\left[\cos^{-1}\left(\frac{\nu}{\nu_c}\right) - \frac{\nu}{\nu_c}\sqrt{1 - \left(\frac{\nu}{\nu_c}\right)^2}\right]$$
 
 Where cutoff frequency is:
-$$\nu_c = \frac{D}{\lambda \cdot f} = \frac{1}{\lambda \cdot F/\#}$$
+$$\nu_c = \frac{D}{\lambda \cdot f} = \frac{1}{\lambda \cdot F/}$$
 
 This equation shows that MTF rolls off gradually, reaching zero at the cutoff frequency where diffraction prevents any contrast transfer.
 
@@ -235,11 +235,11 @@ This 36% contrast loss at Nyquist is inherent to sampled imaging systems and can
 
 ### 5.4 Atmospheric MTF
 
-For thermal imaging through atmosphere, turbulence degrades resolution according to:
+For thermal imaging through the atmosphere, turbulence degrades resolution according to:
 
 $$\text{MTF}_{\text{atm}}(\nu) = \exp\left[-3.44\left(\frac{\lambda \cdot \nu \cdot R}{r_0}\right)^{5/3}\right]$$
 
-This equation shows exponential decay with turbulence strength (smaller $r_0$), limiting high-frequency content. The formula assumes long-exposure averaging; at 60 Hz frame rates, individual frames may show better instantaneous resolution but with spatially-varying distortion.
+This equation shows exponential decay with turbulence strength (smaller $r_0$), limiting high-frequency content. The formula assumes long-exposure averaging; at 60 Hz frame rates, individual frames may show better instantaneous resolution but with spatially varying distortion.
 
 Where $r_0$ is the Fried parameter (atmospheric coherence length), representing the diameter over which the wavefront remains correlated.
 
@@ -320,11 +320,11 @@ Where:
 - $\mathbf{p}_i$ = feature/pixel locations.
 - $\rho(\cdot)$ = robust loss function.
 
-The robust loss function $\rho(\cdot)$ reduces sensitivity to outliers (occluded regions, moving objects). Common choices include the Huber loss (quadratic for small errors, linear for large) and Cauchy loss (heavy-tailed, more outlier-resistant), which prevent spurious matches from corrupting the motion estimate.
+The robust loss function $\rho(\cdot)$ reduces sensitivity to outliers (occluded regions, moving objects). Common choices include the Huber loss (quadratic for small errors, linear for large errors) and the Cauchy loss (heavy-tailed, more outlier-resistant), which prevent spurious matches from corrupting the motion estimate.
 
 ### 6.4 Time Synchronization Requirements
 
-Synchronization error $\Delta t$ between camera and IMU causes angular error:
+Synchronization error $\Delta t$ between the camera and IMU causes angular error:
 $$\theta_{error} = \omega \cdot \Delta t$$
 
 For 1°/s rotation (17.45 mrad/s) and 0.5 pixel tolerance (25 µrad at 300mm):
@@ -347,7 +347,7 @@ Where $H_k = D \cdot B \cdot W_k$ combines:
 - $B$ = blur operator (PSF).
 - $D$ = downsampling operator.
 
-This linear model enables tractable optimization approaches for reconstruction.
+This linear model enables tractable reconstruction optimization.
 
 ### 7.2 Maximum A Posteriori (MAP) Estimation
 
@@ -377,7 +377,7 @@ BTV considers multiple spatial shifts, better preserving fine detail and texture
 **Learned Prior (Deep Network):**
 $$R_{learned}(x) = \|x - f_\theta(x)\|^2$$
 
-Where $f_\theta$ is a denoising neural network trained on representative imagery. Deep learning approaches (e.g., SRGAN, EDSR adapted for MWIR) can capture complex image statistics but require training data and may hallucinate details not present in the input. For safety-critical applications, classical methods with understood failure modes may be preferred.
+Where $f_\theta$ is a denoising neural network trained on representative imagery, deep learning approaches (e.g., SRGAN, EDSR adapted for MWIR) can capture complex image statistics but require training data and may hallucinate details not present in the input. For safety-critical applications, classical methods with understood failure modes may be preferred.
 
 ### 7.4 Iterative Solution
 
@@ -410,7 +410,7 @@ Output: x⁽ᵗ⁾
 - Regularization weight $\lambda$: 0.01-0.1; higher values produce smoother results.
 - Convergence typically occurs within 20-50 iterations.
 
-**Potential Artifacts:** BTV regularization can produce ringing near high-contrast edges if $\lambda$ is too low. TV can create blocky artifacts in textured regions. Monitor convergence and visually inspect results during development.
+**Artifacts:** BTV regularization can produce ringing near high-contrast edges if $\lambda$ is too low. TV can create blocky artifacts in textured regions. Monitor convergence and visually inspect results during development.
 
 ### 7.5 Computational Complexity
 
@@ -425,8 +425,6 @@ For 2× super-resolution (1280×1024 output), 20 frames, 30 iterations:
 $$\approx 30 \times 20 \times 1.3\text{M} = 780\text{M operations per frame}$$
 
 This is achievable at ~10 Hz on embedded GPU platforms (e.g., NVIDIA Jetson Orin with ~200 TOPS INT8).
-
-*[Figure recommended: Flowchart showing SR reconstruction pipeline from frame input through motion estimation, alignment, fusion, and output.]*
 
 ---
 
@@ -447,11 +445,11 @@ Lucky imaging exploits the fact that turbulence quality varies from frame to fra
 
 **Implementation:**
 
-1. **Quality metric:** Compute sharpness metric for each frame.
+1. **Quality metric:** Compute the sharpness metric for each frame.
    $$Q_k = \sum_{i,j} |\nabla I_k(i,j)|^2$$
    Higher gradient magnitude indicates sharper images with more preserved high-frequency content.
 
-2. **Frame selection:** Use top 10-30% highest quality frames for reconstruction.
+2. **Frame selection:** Use the top 10-30% highest quality frames for reconstruction.
 
 3. **Weighted fusion:** Weight frames by quality in SR reconstruction.
    $$\hat{x} = \arg\min_x \sum_k w_k \|y_k - H_k x\|^2$$
@@ -484,7 +482,7 @@ For 64×64 pixel patches on a 640×512 image with 50% overlap, this yields appro
 
 ## 9. Implementation Pipeline
 
-### 9.1 Real-Time Architecture
+### 9.1 Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
@@ -498,9 +496,7 @@ For 64×64 pixel patches on a 640×512 image with 50% overlap, this yields appro
 └─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
-*[Figure recommended: Detailed block diagram with data rates, buffer sizes, and processing modules.]*
-
-### 9.2 Timing Budget (Target: 100ms per output frame)
+### 9.2 Timing Budget
 
 | Stage | Time (ms) | Notes |
 |-------|-----------|-------|
@@ -537,9 +533,8 @@ With reliable 2× super-resolution (conservative estimate accounting for real-wo
 | 200 mm | 18.3 | 9.15 | 21.9 |
 | 300 mm | 12.2 | 6.1 | 32.8 |
 
-** Finding:** With 2× super-resolution, 150mm focal length achieves identification capability equivalent to native 300mm, enabling wider field of view for initial target acquisition.
+**Finding:** With 2× super-resolution, a 150mm focal length achieves identification capability equivalent to that of a native 300mm lens, enabling a wider field of view for initial target acquisition.
 
-*[Figure recommended: Bar chart comparing native vs. enhanced pixels-on-target across focal lengths.]*
 
 ### 10.2 Johnson Criteria Compliance (8,000 ft AGL, 2m Vehicle)
 
@@ -552,7 +547,7 @@ With reliable 2× super-resolution (conservative estimate accounting for real-wo
 
 ### 10.3 SNR Requirements
 
-Super-resolution performance depends strongly on input SNR. Below are expected gains based on empirical studies:
+Super-resolution performance depends on input SNR. Below are expected gains based on empirical studies:
 
 | SNR (dB) | Expected Resolution Gain | Quality Assessment |
 |----------|-------------------------|---------------------|
@@ -564,7 +559,7 @@ Super-resolution performance depends strongly on input SNR. Below are expected g
 **Neutrino LC SNR Estimate** (scene ΔT = 2°C, NEdT = 30 mK):
 $$\text{SNR} = \frac{\Delta T}{\text{NEdT}} = \frac{2000 \text{ mK}}{30 \text{ mK}} \approx 67 \approx 36 \text{ dB}$$
 
-This excellent SNR provides substantial margin for robust super-resolution. Note that full NETD characterization includes integration time effects; the above is a first-order approximation.
+This excellent SNR provides a substantial margin for robust super-resolution. Full NETD characterization includes integration time effects; the above is a first-order approximation.
 
 ### 10.4 Sensitivity Analysis
 
@@ -687,13 +682,13 @@ $$G_{SR} = \frac{\text{MTF50}_{\text{enhanced}}}{\text{MTF50}_{\text{native}}}$$
 **System Failure Modes:**
 - Complete loss of IMU data: Fall back to image-only alignment (slower, less robust).
 - Severe turbulence: Lucky imaging may reject >90% of frames, reducing output rate.
-- Insufficient sub-pixel diversity: Algorithm converges to interpolated (not super-resolved) result.
+- Insufficient sub-pixel diversity: Algorithm converges to an interpolated result.
 
 ### 13.3 Workflow Summary
 
 1. **Acquire:** Capture 20-30 frames at 60 Hz (333-500 ms burst).
 2. **Estimate Motion:** Integrate IMU data, refine with image-based alignment.
-3. **Quality Select:** Rank frames by sharpness, weight or reject low-quality frames.
+3. **Quality Select:** Rank frames by sharpness, weight, or reject low-quality frames.
 4. **Reconstruct:** MAP estimation with BTV regularization (20-50 iterations).
 5. **Validate:** Check convergence, flag low-confidence regions.
 6. **Output:** Enhanced frame at 10 Hz with metadata.
