@@ -715,21 +715,7 @@ Pro-rated: $540/unit (1 GCS per 10 aircraft)
 
 ## 15. Summary
 
-### 15.1 Modifications from ISR Variant
-
-| Aspect | ISR (Original) | Interceptor (Modified) |
-|--------|----------------|------------------------|
-| **Airframe** | Quad-plane VTOL, 2.2m span | Flying wing, 1.4m span |
-| **Max Speed** | 70 knots | 191 knots (220 MPH) |
-| **Propulsion** | 5× KDE motors (VTOL+cruise) | 1× Schübeler EDF |
-| **Battery** | 6S 16Ah LiPo | 12S 10Ah LiPo |
-| **Weight** | 28 lbs | 14 lbs |
-| **Endurance** | 90–120 min | 8–15 min |
-| **Payload** | EO/IR gimbal ($5,500) | Seeker + kinetic nose ($1,400) |
-| **Recovery** | Reusable VTOL | Expendable (or chute) |
-| **Unit Cost** | $16,000 | $12,000 (at 50 units) |
-
-### 15.2 Compliance Status
+### 15.1 Compliance Status
 
 | Requirement | Status |
 |-------------|--------|
@@ -738,7 +724,7 @@ Pro-rated: $540/unit (1 GCS per 10 aircraft)
 | Allied-nation sourcing | ✓ USA, Germany, Australia, Switzerland, Taiwan, Japan |
 | ITAR-free | ✓ No controlled items |
 
-### 15.3 Path Forward
+### 15.2 Path Forward
 
 1. **Phase 1 (3 months):** Detailed design, CFD analysis, component procurement
 2. **Phase 2 (2 months):** Prototype fabrication (3 units)
