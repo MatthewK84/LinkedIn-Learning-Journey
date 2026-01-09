@@ -12,17 +12,17 @@
 
 This document defines requirements for a high-speed counter-UAS (C-UAS) interceptor capable of autonomous target engagement at speeds up to 220 MPH (191 knots / 98 m/s). The platform is designed for rapid-response intercept of Group 1–2 adversarial drones in defended airspace.
 
-**Capability Differences from ISR Variant:**
+**Capability Requirements:**
 
-| Parameter | ISR Variant | Interceptor Variant |
-|-----------|-------------|---------------------|
-| Maximum Speed | 70 knots | 191 knots (220 MPH) |
-| Mission | Surveillance | Target neutralization |
-| Endurance | 90–120 min | 15–25 min (sprint capable) |
-| Payload | EO/IR gimbal | Tracking sensor + defeat mechanism |
-| Configuration | Quad-plane VTOL | Flying wing or swept-wing |
-| Recovery | Reusable | Expendable or recoverable |
-| Maneuverability | 2g sustained | 8–12g instantaneous |
+| Parameter | Interceptor|
+|-----------|-------------|
+| Maximum Speed | 191 knots (220 MPH) |
+| Mission | Target neutralization |
+| Endurance | 15–25 min (sprint capable) |
+| Payload | Tracking sensor + defeat mechanism |
+| Configuration | Flying wing or swept-wing |
+| Recovery | Expendable or recoverable |
+| Maneuverability | 8–12g instantaneous |
 
 ---
 
