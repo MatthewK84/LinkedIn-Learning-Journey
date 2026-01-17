@@ -1,6 +1,6 @@
 """
 Risk Parity Portfolio Builder
-A Streamlit app for constructing and analyzing risk parity portfolios.
+Streamlit App for constructing and analyzing risk parity portfolios.
 """
 
 import streamlit as st
@@ -52,9 +52,22 @@ def fetch_data(tickers: list, period: str = "2y") -> pd.DataFrame:
     """Fetch historical price data from Yahoo Finance."""
     import yfinance as yf
     
-    data = yf.download(tickers, period=period, progress=False)["Adj Close"]
+    # Use auto_adjust=True to get adjusted prices in the "Close" column
+    data = yf.download(tickers, period=period, progress=False, auto_adjust=True)
+    
+    # Handle different yfinance return formats
+    if isinstance(data.columns, pd.MultiIndex):
+        # Multi-ticker case with MultiIndex columns
+        data = data["Close"]
+    elif "Close" in data.columns:
+        # Single ticker or flat columns
+        data = data[["Close"]]
+        data.columns = tickers
+    
+    # Ensure DataFrame format for single ticker
     if isinstance(data, pd.Series):
         data = data.to_frame(name=tickers[0])
+    
     return data
 
 
