@@ -1,0 +1,27 @@
+# Dependencies
+streamlit>=1.32.0
+pandas>=2.1.4
+numpy>=1.26.3
+yfinance>=0.2.37
+matplotlib>=3.8.2
+plotly>=5.18.0
+requests>=2.31.0
+lxml>=4.9.3
+pymavlink>=2.4.47
+ijson>=3.3.0
+indexed-gzip>=1.9.5
+fpdf>=1.7.2
+emailmessage>=0.2.1
+riskfolio-lib>=6.0.0
+scipy>=1.11.0
+cvxpy>=1.4.0
+
+# Additional Components
+pydeck==0.8.0
+openpyxl>=3.1.2
+graphviz>=0.20.2
+streamlit-sortables>=0.3.1
+pillow>=10.0.0
+
+# Geographic Components
+pyproj>=3.6.0
