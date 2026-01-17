@@ -1,6 +1,6 @@
 """
 Risk Parity Portfolio Builder
-Streamlit App for constructing and analyzing risk parity portfolios.
+A Streamlit App for constructing and analyzing risk parity portfolios.
 """
 
 import streamlit as st
@@ -47,28 +47,69 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+def generate_sample_data(tickers: list, days: int = 504) -> pd.DataFrame:
+    """Generate synthetic price data when Yahoo Finance is unavailable."""
+    np.random.seed(42)
+    
+    # Realistic parameters for common ETFs
+    params = {
+        "SPY": {"mu": 0.10, "sigma": 0.18},
+        "TLT": {"mu": 0.04, "sigma": 0.14},
+        "GLD": {"mu": 0.05, "sigma": 0.15},
+        "VNQ": {"mu": 0.08, "sigma": 0.20},
+        "EFA": {"mu": 0.07, "sigma": 0.17},
+    }
+    default_params = {"mu": 0.06, "sigma": 0.16}
+    
+    dates = pd.date_range(end=pd.Timestamp.today(), periods=days, freq="B")
+    prices = {}
+    
+    for ticker in tickers:
+        p = params.get(ticker, default_params)
+        daily_mu = p["mu"] / 252
+        daily_sigma = p["sigma"] / np.sqrt(252)
+        returns = np.random.normal(daily_mu, daily_sigma, days)
+        prices[ticker] = 100 * np.exp(np.cumsum(returns))
+    
+    return pd.DataFrame(prices, index=dates)
+
+
 @st.cache_data(ttl=3600)
 def fetch_data(tickers: list, period: str = "2y") -> pd.DataFrame:
-    """Fetch historical price data from Yahoo Finance."""
+    """Fetch historical price data from Yahoo Finance with fallback."""
     import yfinance as yf
     
-    # Use auto_adjust=True to get adjusted prices in the "Close" column
-    data = yf.download(tickers, period=period, progress=False, auto_adjust=True)
+    period_days = {"1y": 252, "2y": 504, "3y": 756, "5y": 1260}
     
-    # Handle different yfinance return formats
-    if isinstance(data.columns, pd.MultiIndex):
-        # Multi-ticker case with MultiIndex columns
-        data = data["Close"]
-    elif "Close" in data.columns:
-        # Single ticker or flat columns
-        data = data[["Close"]]
-        data.columns = tickers
-    
-    # Ensure DataFrame format for single ticker
-    if isinstance(data, pd.Series):
-        data = data.to_frame(name=tickers[0])
-    
-    return data
+    try:
+        # Use auto_adjust=True to get adjusted prices in the "Close" column
+        data = yf.download(tickers, period=period, progress=False, auto_adjust=True)
+        
+        # Check if download failed (empty or error)
+        if data.empty:
+            raise ValueError("Empty data returned")
+        
+        # Handle different yfinance return formats
+        if isinstance(data.columns, pd.MultiIndex):
+            # Multi-ticker case with MultiIndex columns
+            data = data["Close"]
+        elif "Close" in data.columns:
+            # Single ticker or flat columns
+            data = data[["Close"]]
+            data.columns = tickers
+        
+        # Ensure DataFrame format for single ticker
+        if isinstance(data, pd.Series):
+            data = data.to_frame(name=tickers[0])
+        
+        return data
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "rate" in error_msg or "limit" in error_msg or "too many" in error_msg or data.empty if 'data' in dir() else True:
+            st.warning("⚠️ Yahoo Finance rate limit hit. Using simulated data for demonstration.")
+            return generate_sample_data(tickers, period_days.get(period, 504))
+        raise e
 
 
 def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
