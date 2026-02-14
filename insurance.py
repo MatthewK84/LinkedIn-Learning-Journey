@@ -26,20 +26,14 @@ DEFAULT_COMPANIES = {
     "Cardinal Health": "CAH",
 }
 
-# 13F infotable uses CUSIP (9 chars). This avoids Yahoo entirely.
-# Sources:
-# - UNH 91324P102 (StockAnalysis/QuantumOnline)
-# - ELV 036752103 (StockAnalysis)
-# - CVS 126650100 (SEC filing/StockAnalysis)
-# - MCK 58155Q103 (StockAnalysis/SEC filing)
-# - COR 03073E105 (SEC filing - legacy AmerisourceBergen; still common-stock CUSIP widely used)
-# - CAH 14149Y108 (Cardinal Health IR/StockAnalysis)
+# 13F datasets identify issuers by CUSIP (9 chars). This avoids Yahoo completely.
+# IMPORTANT: Verify CUSIPs if you change tickers or expand the universe.
 TICKER_TO_CUSIP = {
     "UNH": "91324P102",
     "ELV": "036752103",
     "CVS": "126650100",
     "MCK": "58155Q103",
-    "COR": "03073E105",
+    "COR": "03073E105",  # legacy AmerisourceBergen common stock CUSIP widely used
     "CAH": "14149Y108",
 }
 
@@ -56,9 +50,10 @@ DEFAULT_TAG_RULES = [
 ]
 
 DB_PATH_DEFAULT = "ownership_13f.sqlite"
+SEC_DOWNLOAD_DIR = "sec_cache"  # zip cache directory (Streamlit Cloud uses ephemeral storage)
 
-SEC_13F_DATASETS_PAGE = "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets"
-SEC_DOWNLOAD_DIR = "sec_cache"  # local cache directory for zips
+# Data.gov CKAN API for the "Form 13F data sets" catalog entry
+DATA_GOV_PACKAGE_SHOW = "https://catalog.data.gov/api/3/action/package_show?id=form-13f-data-sets"
 
 # ============================================================
 # DATA MODEL
@@ -100,7 +95,6 @@ def db_init(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS uq_quarter_meta_label
         ON quarter_meta(quarter_label);
 
-        -- Canonical holdings derived from 13F infotable + coverpage/submission joins
         CREATE TABLE IF NOT EXISTS holdings_13f (
             holding_id INTEGER PRIMARY KEY AUTOINCREMENT,
             quarter_end TEXT NOT NULL,
@@ -119,7 +113,6 @@ def db_init(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_holdings_qtr_manager
         ON holdings_13f(quarter_end, manager_name);
 
-        -- Optional: keep a mapping of accession -> manager/period (debug/traceability)
         CREATE TABLE IF NOT EXISTS accession_map (
             accession_number TEXT PRIMARY KEY,
             period_of_report TEXT,
@@ -145,51 +138,53 @@ def apply_tags(holder_name: str, custom_rules: List[Tuple[str, str]]) -> List[st
     return tags
 
 
-def sec_headers(app_name: str, email: str) -> Dict[str, str]:
-    """
-    SEC asks automated clients to identify themselves with a real contact.
-    Put your real email in the sidebar input.
-    """
-    ua = f"{app_name} ({email})" if email else app_name
-    return {
-        "User-Agent": ua,
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-    }
-
-
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def parse_sec_dataset_links(html: str) -> List[Tuple[str, str]]:
-    """
-    Returns list of (label, zip_url).
-    """
-    # The SEC page contains anchors whose href ends with _form13f.zip
-    # Example: https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01jun2025-31aug2025_form13f.zip
-    zip_urls = sorted(set(re.findall(r"https://www\.sec\.gov/files/structureddata/data/form-13f-data-sets/[^\"']+_form13f\.zip", html)))
-    pairs: List[Tuple[str, str]] = []
-    for u in zip_urls:
-        fname = u.rsplit("/", 1)[-1]
-        label = fname.replace("_form13f.zip", "").replace("-", " - ")
-        pairs.append((label, u))
-    # Newest tend to appear last alphabetically, but not guaranteed; we’ll keep list and also store label.
-    return pairs
+def _to_number(x) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        if isinstance(x, str):
+            x = x.strip().replace(",", "")
+            if x == "":
+                return None
+        return float(x)
+    except Exception:
+        return None
 
 
-def quarter_end_from_label(label: str) -> Optional[str]:
+def sec_headers(app_name: str, email: str) -> Dict[str, str]:
     """
-    Best-effort derive quarter_end from filename label like:
-      '01jun2025 - 31aug2025'  -> 2025-08-31
-      '01sep2025 - 30nov2025'  -> 2025-11-30
+    SEC expects automated clients to identify themselves with a real contact.
+    Many SEC endpoints will 403 without a proper User-Agent and From.
     """
-    m = re.search(r"(\d{2}[a-z]{3}\d{4})\s*-\s*(\d{2}[a-z]{3}\d{4})", label, flags=re.IGNORECASE)
+    if not email or "@" not in email:
+        raise ValueError("SEC downloads require a real contact email (for User-Agent/From).")
+
+    ua = f"{app_name} ({email})"
+    return {
+        "User-Agent": ua,
+        "From": email,
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+
+
+def quarter_end_from_filename_or_text(text: str) -> Optional[str]:
+    """
+    Best-effort quarter end extraction from common SEC dataset filename patterns.
+
+    Examples commonly seen:
+      01jun2025-31aug2025_form13f.zip  -> 2025-08-31
+      01sep2025-30nov2025_form13f.zip  -> 2025-11-30
+    """
+    m = re.search(r"(\d{2}[a-z]{3}\d{4})-(\d{2}[a-z]{3}\d{4})", text, flags=re.IGNORECASE)
     if not m:
         return None
     end_s = m.group(2)
-    # Parse ddmonyyyy to YYYY-MM-DD
     try:
         dt = datetime.strptime(end_s, "%d%b%Y").date()
         return dt.isoformat()
@@ -197,23 +192,78 @@ def quarter_end_from_label(label: str) -> Optional[str]:
         return None
 
 
+def label_from_resource(res: dict) -> str:
+    """
+    Derive a readable label for a Data.gov resource.
+    """
+    name = (res.get("name") or "").strip()
+    title = (res.get("title") or "").strip()
+    url = (res.get("url") or "").strip()
+    if title:
+        return title
+    if name:
+        return name
+    return url.rsplit("/", 1)[-1]
+
+
+def _zip_cache_path(quarter_label: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", quarter_label)
+    return os.path.join(SEC_DOWNLOAD_DIR, f"{safe}.zip")
+
+
+def _find_member(z: zipfile.ZipFile, table_prefix: str) -> Optional[str]:
+    """
+    Finds member like 'INFOTABLE.tsv' regardless of folder/case.
+    """
+    for n in z.namelist():
+        base = n.rsplit("/", 1)[-1]
+        if base.upper().startswith(table_prefix.upper()) and base.lower().endswith(".tsv"):
+            return n
+    return None
+
+
+def _norm_period(x: str) -> str:
+    if not isinstance(x, str) or not x:
+        return ""
+    x = x.strip()
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(x, fmt).date().isoformat()
+        except Exception:
+            pass
+    return x
+
+
 # ============================================================
-# SEC: LIST AVAILABLE QUARTERS
+# DATA.GOV: LIST AVAILABLE QUARTERS (NO SEC PAGE SCRAPE)
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fetch_available_quarters(app_name: str, email: str) -> List[Tuple[str, str, Optional[str]]]:
+def fetch_available_quarters_from_datagov() -> List[Tuple[str, str, Optional[str]]]:
     """
-    Returns list of (quarter_label, zip_url, quarter_end_iso)
+    Returns list of (quarter_label, zip_url, quarter_end_iso) from Data.gov CKAN API.
+
+    This avoids scraping sec.gov pages (which can 403 from some hosts).
     """
-    r = requests.get(SEC_13F_DATASETS_PAGE, headers=sec_headers(app_name, email), timeout=60)
+    r = requests.get(DATA_GOV_PACKAGE_SHOW, timeout=60)
     r.raise_for_status()
-    pairs = parse_sec_dataset_links(r.text)
-    out = []
-    for label, url in pairs:
-        out.append((label, url, quarter_end_from_label(label)))
-    # Prefer newest first by quarter_end if present
-    out.sort(key=lambda x: (x[2] or ""), reverse=True)
+    js = r.json()
+    resources = (js.get("result") or {}).get("resources") or []
+
+    out: List[Tuple[str, str, Optional[str]]] = []
+    for res in resources:
+        url = (res.get("url") or "").strip()
+        if not url:
+            continue
+        # Only keep the ZIP resources for form 13f datasets
+        if url.lower().endswith("_form13f.zip"):
+            label = label_from_resource(res)
+            fname = url.rsplit("/", 1)[-1]
+            q_end = quarter_end_from_filename_or_text(fname) or quarter_end_from_filename_or_text(label)
+            out.append((label, url, q_end))
+
+    # Prefer newest first by quarter_end if present; else by label
+    out.sort(key=lambda x: (x[2] or "", x[0]), reverse=True)
     return out
 
 
@@ -221,21 +271,21 @@ def fetch_available_quarters(app_name: str, email: str) -> List[Tuple[str, str, 
 # SEC: DOWNLOAD + INGEST 13F ZIP
 # ============================================================
 
-def _zip_cache_path(quarter_label: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", quarter_label)
-    return os.path.join(SEC_DOWNLOAD_DIR, f"{safe}.zip")
-
-
 def download_zip_if_needed(zip_url: str, quarter_label: str, app_name: str, email: str) -> str:
     """
-    Returns local path to zip (cached on disk).
+    Downloads the dataset ZIP from the SEC (or wherever the resource URL points),
+    stores it in a local cache. Returns local file path.
     """
     ensure_dir(SEC_DOWNLOAD_DIR)
     path = _zip_cache_path(quarter_label)
+
+    # If cached and non-trivial size, reuse
     if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
         return path
 
-    with requests.get(zip_url, headers=sec_headers(app_name, email), stream=True, timeout=300) as r:
+    headers = sec_headers(app_name, email)
+
+    with requests.get(zip_url, headers=headers, stream=True, timeout=300, allow_redirects=True) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -244,37 +294,30 @@ def download_zip_if_needed(zip_url: str, quarter_label: str, app_name: str, emai
     return path
 
 
-def _find_member(z: zipfile.ZipFile, table_prefix: str) -> Optional[str]:
-    """
-    Finds member like 'INFOTABLE.tsv' or 'COVERPAGE.tsv' regardless of case or folder.
-    """
-    names = z.namelist()
-    # SEC doc says: SUBMISSION, COVERPAGE, INFOTABLE etc. TSV, tab-delimited UTF-8
-    for n in names:
-        base = n.rsplit("/", 1)[-1]
-        if base.upper().startswith(table_prefix.upper()) and base.lower().endswith(".tsv"):
-            return n
-    return None
-
-
 def ingest_13f_quarter(
     conn: sqlite3.Connection,
     quarter_label: str,
-    quarter_end: Optional[str],
+    quarter_end_hint: Optional[str],
     zip_url: str,
     tickers: List[str],
     app_name: str,
     email: str,
 ) -> IngestMeta:
     """
-    Ingests SEC 13F dataset ZIP into holdings_13f table for specified tickers.
-    Uses:
-      SUBMISSION.tsv: accession_number, cik, periodofreport
-      COVERPAGE.tsv: accession_number, filingmanager_name
-      INFOTABLE.tsv: accession_number, cusip, sshprnamt, value
+    Ingest SEC 13F dataset ZIP into holdings_13f for specified tickers.
+
+    Expects TSVs inside ZIP:
+      SUBMISSION.tsv: ACCESSION_NUMBER, CIK, PERIODOFREPORT
+      COVERPAGE.tsv:  ACCESSION_NUMBER, FILINGMANAGER_NAME
+      INFOTABLE.tsv:  ACCESSION_NUMBER, CUSIP, VALUE, SSHPRNAMT
+
+    Note: VALUE is in thousands of dollars in these datasets.
     """
     asof = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     cusips = {TICKER_TO_CUSIP[t] for t in tickers if t in TICKER_TO_CUSIP}
+    if not cusips:
+        return IngestMeta(asof, quarter_label, zip_url, 0, "No CUSIPs configured for selected tickers.")
 
     try:
         local_zip = download_zip_if_needed(zip_url, quarter_label, app_name, email)
@@ -283,12 +326,11 @@ def ingest_13f_quarter(
             sub_m = _find_member(z, "SUBMISSION")
             cov_m = _find_member(z, "COVERPAGE")
             info_m = _find_member(z, "INFOTABLE")
-
             if not (sub_m and cov_m and info_m):
                 missing = [k for k, v in [("SUBMISSION", sub_m), ("COVERPAGE", cov_m), ("INFOTABLE", info_m)] if not v]
                 raise RuntimeError(f"Missing TSV(s) in ZIP: {missing}")
 
-            # ---- Read SUBMISSION (accession -> cik, period)
+            # SUBMISSION
             with z.open(sub_m) as fsub:
                 sub = pd.read_csv(
                     fsub,
@@ -298,23 +340,16 @@ def ingest_13f_quarter(
                     low_memory=False,
                 )
             sub.columns = [c.strip().upper() for c in sub.columns]
-            sub = sub.rename(columns={"ACCESSION_NUMBER": "accession_number", "CIK": "manager_cik", "PERIODOFREPORT": "period_of_report"})
-
-            # Normalize period format if it’s DD-MON-YYYY
-            def _norm_period(x: str) -> str:
-                if not isinstance(x, str) or not x:
-                    return ""
-                x = x.strip()
-                for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
-                    try:
-                        return datetime.strptime(x, fmt).date().isoformat()
-                    except Exception:
-                        pass
-                return x  # keep raw
-
+            sub = sub.rename(
+                columns={
+                    "ACCESSION_NUMBER": "accession_number",
+                    "CIK": "manager_cik",
+                    "PERIODOFREPORT": "period_of_report",
+                }
+            )
             sub["period_of_report"] = sub["period_of_report"].apply(_norm_period)
 
-            # ---- Read COVERPAGE (accession -> manager_name)
+            # COVERPAGE
             with z.open(cov_m) as fcov:
                 cov = pd.read_csv(
                     fcov,
@@ -325,23 +360,21 @@ def ingest_13f_quarter(
                 )
             cov.columns = [c.strip().upper() for c in cov.columns]
             cov = cov.rename(columns={"ACCESSION_NUMBER": "accession_number", "FILINGMANAGER_NAME": "manager_name"})
+            cov["manager_name"] = cov["manager_name"].fillna("").astype(str).str.strip()
 
-            # ---- Join accession map (for manager selector + auditing)
+            # Accession map join
             acc = sub.merge(cov, on="accession_number", how="inner")
-            acc["manager_name"] = acc["manager_name"].fillna("").str.strip()
             acc = acc[acc["manager_name"] != ""].copy()
 
-            # Quarter end: if not provided, infer from the dominant period_of_report
-            inferred_qend = quarter_end
-            if not inferred_qend:
-                # most common period in this dataset
+            # Determine quarter_end
+            quarter_end = quarter_end_hint
+            if not quarter_end:
                 mode = acc["period_of_report"].mode()
-                inferred_qend = mode.iloc[0] if len(mode) else None
+                quarter_end = mode.iloc[0] if len(mode) else None
+            if not quarter_end:
+                quarter_end = "UNKNOWN"
 
-            if not inferred_qend:
-                inferred_qend = "UNKNOWN"
-
-            # Persist accession map (upsert)
+            # Persist accession_map (upsert)
             cur = conn.cursor()
             for _, r in acc.iterrows():
                 cur.execute(
@@ -353,8 +386,7 @@ def ingest_13f_quarter(
                 )
             conn.commit()
 
-            # ---- Stream INFOTABLE and filter by CUSIP in chunks
-            # VALUE is market value in thousands of dollars per SEC doc.
+            # INFOTABLE (chunked)
             chunks = []
             with z.open(info_m) as finfo:
                 it = pd.read_csv(
@@ -379,7 +411,6 @@ def ingest_13f_quarter(
                     chunk = chunk[chunk["cusip"].isin(cusips)].copy()
                     if chunk.empty:
                         continue
-                    # numeric coercion
                     chunk["value_usd"] = pd.to_numeric(chunk["value_k"], errors="coerce") * 1000.0
                     chunk["shares"] = pd.to_numeric(chunk["shares"], errors="coerce")
                     chunks.append(chunk[["accession_number", "cusip", "shares", "value_usd"]])
@@ -388,37 +419,32 @@ def ingest_13f_quarter(
                 raise RuntimeError("No matching CUSIP rows found in INFOTABLE for selected tickers.")
 
             info = pd.concat(chunks, ignore_index=True)
-            # join manager identity
             info = info.merge(acc[["accession_number", "manager_cik", "manager_name"]], on="accession_number", how="left")
             info = info[info["manager_name"].notna()].copy()
 
-            # Map cusip -> ticker
             cusip_to_ticker = {v: k for k, v in TICKER_TO_CUSIP.items()}
             info["ticker"] = info["cusip"].map(cusip_to_ticker)
 
-            # Aggregate by quarter_end + ticker + manager
             agg = (
                 info.groupby(["ticker", "cusip", "manager_cik", "manager_name"], dropna=False)[["shares", "value_usd"]]
                 .sum()
                 .reset_index()
             )
-            agg["quarter_end"] = inferred_qend
+            agg["quarter_end"] = quarter_end
             agg["quarter_label"] = quarter_label
 
-            # Delete prior ingests for this quarter_label to make it idempotent
+            # Idempotent: delete old rows for this label then insert
             conn.execute("DELETE FROM holdings_13f WHERE quarter_label = ?", (quarter_label,))
             conn.commit()
-
-            # Insert
             agg.to_sql("holdings_13f", conn, if_exists="append", index=False)
 
-            # Record quarter_meta
+            # Update quarter_meta
             conn.execute(
                 """
                 INSERT OR REPLACE INTO quarter_meta(quarter_label, quarter_end, zip_url, asof_utc, ingest_ok, error)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (quarter_label, inferred_qend, zip_url, asof, 1, None),
+                (quarter_label, quarter_end, zip_url, asof, 1, None),
             )
             conn.commit()
 
@@ -430,14 +456,14 @@ def ingest_13f_quarter(
             INSERT OR REPLACE INTO quarter_meta(quarter_label, quarter_end, zip_url, asof_utc, ingest_ok, error)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (quarter_label, quarter_end, zip_url, asof, 0, str(e)),
+            (quarter_label, quarter_end_hint, zip_url, asof, 0, str(e)),
         )
         conn.commit()
         return IngestMeta(asof, quarter_label, zip_url, 0, str(e))
 
 
 # ============================================================
-# QUERY HELPERS (Quarter selector / Manager selector / Changes)
+# QUERY HELPERS (Quarter Selector / Manager Selector / Changes)
 # ============================================================
 
 def list_loaded_quarters(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -481,6 +507,9 @@ def get_prior_quarter_end(conn: sqlite3.Connection, quarter_end: str) -> Optiona
 def compute_changes_since_prior(conn: sqlite3.Connection, quarter_end: str, tickers: List[str]) -> Tuple[pd.DataFrame, Optional[str]]:
     prior = get_prior_quarter_end(conn, quarter_end)
     cur = get_holdings_for_quarter(conn, quarter_end, tickers)
+    if cur.empty:
+        return cur, prior
+
     if not prior:
         cur["shares_change"] = None
         cur["value_change"] = None
@@ -498,11 +527,11 @@ def compute_changes_since_prior(conn: sqlite3.Connection, quarter_end: str, tick
 # STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="SEC 13F Ownership Tracker", layout="wide")
-st.title("Institutional Ownership Tracker — SEC 13F (No Yahoo)")
+st.set_page_config(page_title="SEC 13F Ownership Tracker (Data.gov index)", layout="wide")
+st.title("Institutional Ownership Tracker — SEC 13F (Data.gov index, no Yahoo)")
 st.caption(
-    "Computes largest institutional holders from SEC Form 13F datasets (quarterly). "
-    "This avoids Yahoo entirely and keeps a historical DB for trends + changes."
+    "Uses Data.gov’s catalog to discover SEC Form 13F dataset ZIPs, then ingests holdings directly from the SEC ZIP files. "
+    "Adds Quarter Selector, Manager Selector, and Change Since Last Quarter."
 )
 
 # Sidebar controls
@@ -512,9 +541,9 @@ db_path = st.sidebar.text_input("SQLite DB Path", DB_PATH_DEFAULT)
 conn = db_connect(db_path)
 db_init(conn)
 
-st.sidebar.subheader("SEC Identification (required for reliable access)")
+st.sidebar.subheader("SEC Identification (required for ZIP download)")
 app_name = st.sidebar.text_input("App name (User-Agent)", "FollowTheHealthInsuranceMoney")
-contact_email = st.sidebar.text_input("Contact email (User-Agent)", "")
+contact_email = st.sidebar.text_input("Contact email (User-Agent/From)", "")
 
 st.sidebar.subheader("Company Universe")
 selected_names = st.sidebar.multiselect(
@@ -532,20 +561,21 @@ if st.sidebar.toggle("Add a custom tag rule"):
     if new_tag and new_pat:
         tag_rules.append((new_tag, new_pat))
 
-# Fetch quarter list from SEC
-with st.sidebar.expander("Available SEC 13F quarters", expanded=False):
+# Fetch quarter list from Data.gov
+with st.sidebar.expander("Available 13F datasets (via Data.gov)", expanded=False):
     try:
-        avail = fetch_available_quarters(app_name, contact_email)
-        st.write(f"Found {len(avail)} downloadable datasets.")
+        avail = fetch_available_quarters_from_datagov()
+        st.write(f"Found {len(avail)} dataset ZIPs.")
+        if len(avail) > 0:
+            st.caption("Tip: pick the newest quarter to ingest first.")
     except Exception as e:
         avail = []
-        st.error(f"Could not fetch SEC datasets list: {e}")
+        st.error(f"Could not fetch Data.gov dataset list: {e}")
 
 # Ingest controls
 st.sidebar.subheader("Ingestion")
 if avail:
     avail_labels = [a[0] for a in avail]
-    default_label = avail_labels[0]
     ingest_label = st.sidebar.selectbox("Choose dataset to ingest", options=avail_labels, index=0)
     ingest_row = next((a for a in avail if a[0] == ingest_label), None)
 else:
@@ -558,44 +588,44 @@ if ingest_btn:
         st.sidebar.error("No dataset selected / available.")
     else:
         q_label, q_url, q_end = ingest_row
-        with st.spinner("Downloading + ingesting SEC 13F dataset (this can take a few minutes)…"):
-            meta = ingest_13f_quarter(
-                conn=conn,
-                quarter_label=q_label,
-                quarter_end=q_end,
-                zip_url=q_url,
-                tickers=selected_tickers,
-                app_name=app_name,
-                email=contact_email,
-            )
-        if meta.ingest_ok:
-            st.sidebar.success(f"Ingested: {q_label}")
-        else:
-            st.sidebar.error(f"Ingest failed: {meta.error}")
+        try:
+            with st.spinner("Downloading + ingesting 13F dataset ZIP (can take a few minutes)…"):
+                meta = ingest_13f_quarter(
+                    conn=conn,
+                    quarter_label=q_label,
+                    quarter_end_hint=q_end,
+                    zip_url=q_url,
+                    tickers=selected_tickers,
+                    app_name=app_name,
+                    email=contact_email,
+                )
+            if meta.ingest_ok:
+                st.sidebar.success(f"Ingested: {q_label}")
+            else:
+                st.sidebar.error(f"Ingest failed: {meta.error}")
+        except Exception as e:
+            st.sidebar.error(str(e))
 
 # Tabs
 tab_overview, tab_company, tab_manager, tab_data, tab_debug = st.tabs(
     ["Overview", "Company Detail", "Manager View", "Data / Exports", "Debug"]
 )
 
-# -----------------------------
-# Quarter selector (global)
-# -----------------------------
 loaded = list_loaded_quarters(conn)
 loaded_ok = loaded[(loaded["ingest_ok"] == 1) & (loaded["quarter_end"].notna())].copy()
 
 if loaded_ok.empty:
-    st.info("No ingested SEC 13F data yet. Use the sidebar to ingest the latest quarter dataset.")
+    st.info("No ingested 13F data yet. Use the sidebar to ingest the latest quarter dataset.")
     st.stop()
 
-# Quarter selector
+# Quarter Selector
 quarter_options = loaded_ok.sort_values("quarter_end", ascending=False)["quarter_end"].tolist()
 quarter_end = st.sidebar.selectbox("Quarter Selector (quarter_end)", options=quarter_options, index=0)
 
-# Pull holdings for current quarter + compute changes since prior
+# Compute current holdings + changes vs prior loaded quarter
 holdings_cur, prior_q = compute_changes_since_prior(conn, quarter_end, selected_tickers)
 
-# Manager selector options based on current quarter + selected universe
+# Manager Selector
 manager_list = sorted(holdings_cur["manager_name"].dropna().unique().tolist())
 manager_choice = st.sidebar.selectbox("Manager Selector", options=["All managers"] + manager_list, index=0)
 
@@ -604,7 +634,7 @@ if manager_choice != "All managers":
 else:
     holdings_view = holdings_cur.copy()
 
-# Add tags + helpful display fields
+# Add tags + display fields
 holdings_view["tags"] = holdings_view["manager_name"].apply(lambda x: ", ".join(apply_tags(str(x), tag_rules)))
 holdings_view["value_usd_m"] = (holdings_view["value_usd"] / 1_000_000.0).round(2)
 if "value_change" in holdings_view.columns:
@@ -612,61 +642,54 @@ if "value_change" in holdings_view.columns:
 
 
 # -----------------------------
-# Overview tab
+# OVERVIEW
 # -----------------------------
 with tab_overview:
     st.subheader("Top institutional holders (SEC 13F)")
 
     if prior_q:
-        st.caption(f"Quarter: **{quarter_end}** (changes vs prior quarter **{prior_q}**).")
+        st.caption(f"Quarter end: **{quarter_end}** (changes vs prior loaded quarter: **{prior_q}**).")
     else:
-        st.caption(f"Quarter: **{quarter_end}** (no prior quarter loaded to compute changes).")
+        st.caption(f"Quarter end: **{quarter_end}** (no prior quarter loaded to compute changes).")
 
-    # Top holders per company by value
-    topn = st.slider("Top N managers per company", 5, 50, 15, 5)
+    topn = st.slider("Top N managers per company (by value)", 5, 50, 15, 5)
 
-    view = holdings_view.copy()
-    view = view.sort_values(["ticker", "value_usd"], ascending=[True, False])
+    view = holdings_view.sort_values(["ticker", "value_usd"], ascending=[True, False]).copy()
     view_ranked = view.groupby("ticker").head(topn)
 
     st.markdown("### Top holders by company (value)")
     st.dataframe(
         view_ranked[
-            [
-                "ticker",
-                "manager_name",
-                "tags",
-                "shares",
-                "value_usd_m",
-                "shares_change",
-                "value_change_m",
-            ]
+            ["ticker", "manager_name", "tags", "shares", "value_usd_m", "shares_change", "value_change_m"]
         ],
         width="stretch",
         hide_index=True,
     )
 
-    st.markdown("### Big 3 concentration (by manager name tags)")
+    st.markdown("### Big 3 concentration (by tag match)")
     big3 = view[view["tags"].str.contains("Vanguard|BlackRock|State Street", regex=True, na=False)].copy()
     if big3.empty:
-        st.caption("No Big 3 managers matched via tag rules in the current filtered view.")
+        st.caption("No Big 3 managers matched via your tag rules in the current view.")
     else:
         conc = big3.groupby("ticker")[["value_usd"]].sum().reset_index()
         conc["big3_value_usd_m"] = (conc["value_usd"] / 1_000_000.0).round(2)
         st.dataframe(conc[["ticker", "big3_value_usd_m"]], width="stretch", hide_index=True)
 
     st.markdown("### Concentration chart (Top holders value, per company)")
-    chart_df = view_ranked.pivot_table(index="manager_name", columns="ticker", values="value_usd_m", aggfunc="sum").fillna(0)
+    chart_df = (
+        view_ranked.pivot_table(index="manager_name", columns="ticker", values="value_usd_m", aggfunc="sum").fillna(0)
+    )
     st.bar_chart(chart_df, width="stretch")
 
 
 # -----------------------------
-# Company detail tab
+# COMPANY DETAIL
 # -----------------------------
 with tab_company:
-    st.subheader("Company Detail — trends across quarters")
+    st.subheader("Company Detail — trends across loaded quarters")
 
     ticker = st.selectbox("Choose a company", options=selected_tickers, index=0)
+
     company_cur = holdings_cur[holdings_cur["ticker"] == ticker].copy()
     company_cur["tags"] = company_cur["manager_name"].apply(lambda x: ", ".join(apply_tags(str(x), tag_rules)))
     company_cur["value_usd_m"] = (company_cur["value_usd"] / 1_000_000.0).round(2)
@@ -682,7 +705,6 @@ with tab_company:
     )
 
     st.markdown("### Trend (value) for selected managers across loaded quarters")
-    # Build history for this ticker across all quarters loaded
     hist = pd.read_sql_query(
         """
         SELECT quarter_end, ticker, manager_name, shares, value_usd
@@ -693,10 +715,14 @@ with tab_company:
         params=[ticker],
     )
     hist["value_usd_m"] = hist["value_usd"] / 1_000_000.0
-    managers = sorted(hist["manager_name"].dropna().unique().tolist())
 
+    managers = sorted(hist["manager_name"].dropna().unique().tolist())
     default_watch = [m for m in managers if re.search(r"Vanguard|BlackRock|State Street", m, re.IGNORECASE)]
-    watch = st.multiselect("Pick managers to trend", options=managers, default=default_watch[:8] if default_watch else managers[:8])
+    watch = st.multiselect(
+        "Pick managers to trend",
+        options=managers,
+        default=(default_watch[:8] if default_watch else managers[:8]),
+    )
 
     trend = hist[hist["manager_name"].isin(watch)].copy()
     if trend.empty:
@@ -707,13 +733,13 @@ with tab_company:
 
 
 # -----------------------------
-# Manager view tab
+# MANAGER VIEW
 # -----------------------------
 with tab_manager:
     st.subheader("Manager View — holdings across your selected universe")
 
     if manager_choice == "All managers":
-        st.info("Use the sidebar Manager Selector to pick a specific manager to view cross-company holdings.")
+        st.info("Use the sidebar Manager Selector to pick a specific manager.")
     else:
         inv = holdings_cur[holdings_cur["manager_name"] == manager_choice].copy()
         inv["value_usd_m"] = (inv["value_usd"] / 1_000_000.0).round(2)
@@ -729,7 +755,7 @@ with tab_manager:
 
 
 # -----------------------------
-# Data / Exports tab
+# DATA / EXPORTS
 # -----------------------------
 with tab_data:
     st.subheader("Data management & exports")
@@ -765,12 +791,12 @@ with tab_data:
 
 
 # -----------------------------
-# Debug tab
+# DEBUG
 # -----------------------------
 with tab_debug:
     st.subheader("Debug / Diagnostics")
 
-    st.markdown("### What the pipeline is doing")
+    st.markdown("### Pipeline state")
     st.write(
         {
             "quarter_end_selected": quarter_end,
@@ -797,5 +823,5 @@ with tab_debug:
 
 st.caption(
     "Note: SEC Form 13F is quarterly and may lag filings. "
-    "For best results, ingest multiple quarters and use the Company/Manager trend views."
+    "For best results, ingest multiple quarters and use the trend views."
 )
