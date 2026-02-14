@@ -36,7 +36,7 @@ DEFAULT_TAG_RULES = [
 
 DB_PATH_DEFAULT = "ownership_snapshots.sqlite"
 
-YAHOO_HOLDERS_URL = "https://finance.yahoo.com/quote/{ticker}/holders?p={ticker}"
+YAHOO_HOLDERS_URL = "https://finance.yahoo.com/quote/{ticker}/holders/"
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
