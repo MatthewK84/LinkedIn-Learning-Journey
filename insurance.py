@@ -15,18 +15,15 @@ import streamlit as st
 # ============================================================
 
 DEFAULT_COMPANIES = {
-    # Big 3 insurers (by enrollment; also among largest by market cap)
     "UnitedHealth Group": "UNH",
     "Elevance Health": "ELV",
     "CVS Health (Aetna)": "CVS",
-    # Big 3 drug wholesalers
     "McKesson": "MCK",
     "Cencora": "COR",
     "Cardinal Health": "CAH",
 }
 
-# 13F datasets identify issuers by CUSIP (9 chars).
-# IMPORTANT: Verify these if you expand the universe.
+# 13F uses CUSIP (9 chars)
 TICKER_TO_CUSIP = {
     "UNH": "91324P102",
     "ELV": "036752103",
@@ -49,10 +46,10 @@ DEFAULT_TAG_RULES = [
 ]
 
 DB_PATH_DEFAULT = "ownership_13f.sqlite"
-SEC_DOWNLOAD_DIR = "sec_cache"  # Streamlit Cloud storage is ephemeral between deploys
+SEC_DOWNLOAD_DIR = "sec_cache"
 
-# Data.gov CKAN API: Form 13F data sets package
 DATA_GOV_PACKAGE_SHOW = "https://catalog.data.gov/api/3/action/package_show?id=form-13f-data-sets"
+
 
 # ============================================================
 # DATA MODEL
@@ -136,10 +133,6 @@ def apply_tags(holder_name: str, custom_rules: List[Tuple[str, str]]) -> List[st
 
 
 def sec_headers(app_name: str, email: str) -> Dict[str, str]:
-    """
-    SEC access policy expects automated clients to identify themselves with a real contact.
-    We enforce this to avoid confusing 403s later.
-    """
     if not email or "@" not in email:
         raise ValueError("SEC downloads require a real contact email (for User-Agent/From).")
     ua = f"{app_name} ({email})"
@@ -196,6 +189,17 @@ def _find_member(z: zipfile.ZipFile, table_prefix: str) -> Optional[str]:
     return None
 
 
+def coerce_numeric_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """
+    Force numeric dtype for specified columns, safely (coerce errors to NaN).
+    This prevents 'object' dtype issues when SQLite returns strings/None.
+    """
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
 # ============================================================
 # DATA.GOV: LIST QUARTERS
 # ============================================================
@@ -232,7 +236,6 @@ def download_zip_if_needed(zip_url: str, quarter_label: str, app_name: str, emai
         return path
 
     headers = sec_headers(app_name, email)
-
     with requests.get(zip_url, headers=headers, stream=True, timeout=300, allow_redirects=True) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
@@ -305,7 +308,7 @@ def ingest_13f_quarter(
             if not quarter_end:
                 quarter_end = "UNKNOWN"
 
-            # Upsert accession_map
+            # Upsert accession_map (helps debugging / traceability)
             cur = conn.cursor()
             for _, r in acc.iterrows():
                 cur.execute(
@@ -349,6 +352,7 @@ def ingest_13f_quarter(
             cusip_to_ticker = {v: k for k, v in TICKER_TO_CUSIP.items()}
             info["ticker"] = info["cusip"].map(cusip_to_ticker)
 
+            # Aggregate by manager per ticker
             agg = (
                 info.groupby(["ticker", "cusip", "manager_cik", "manager_name"], dropna=False)[["shares", "value_usd"]]
                 .sum()
@@ -357,12 +361,14 @@ def ingest_13f_quarter(
             agg["quarter_end"] = quarter_end
             agg["quarter_label"] = quarter_label
 
-            # Idempotent load
+            # Ensure numeric dtypes before inserting
+            agg = coerce_numeric_cols(agg, ["shares", "value_usd"])
+
+            # Idempotent: delete old then insert
             conn.execute("DELETE FROM holdings_13f WHERE quarter_label = ?", (quarter_label,))
             conn.commit()
             agg.to_sql("holdings_13f", conn, if_exists="append", index=False)
 
-            # quarter_meta
             conn.execute(
                 """
                 INSERT OR REPLACE INTO quarter_meta(quarter_label, quarter_end, zip_url, asof_utc, ingest_ok, error)
@@ -387,7 +393,7 @@ def ingest_13f_quarter(
 
 
 # ============================================================
-# QUERIES (Quarter Selector / Manager Selector / Changes)
+# QUERIES (Quarter / Manager / Changes)
 # ============================================================
 
 def list_loaded_quarters(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -408,7 +414,10 @@ def get_holdings_for_quarter(conn: sqlite3.Connection, quarter_end: str, tickers
     WHERE quarter_end = ?
       AND ticker IN ({",".join(["?"] * len(tickers))})
     """
-    return pd.read_sql_query(q, conn, params=[quarter_end] + tickers)
+    df = pd.read_sql_query(q, conn, params=[quarter_end] + tickers)
+    # SQLite sometimes returns these as object; force numeric:
+    df = coerce_numeric_cols(df, ["shares", "value_usd"])
+    return df
 
 
 def get_prior_quarter_end(conn: sqlite3.Connection, quarter_end: str) -> Optional[str]:
@@ -435,13 +444,18 @@ def compute_changes_since_prior(conn: sqlite3.Connection, quarter_end: str, tick
         return cur, prior
 
     if not prior:
-        cur["shares_change"] = None
-        cur["value_change"] = None
+        cur["shares_change"] = pd.NA
+        cur["value_change"] = pd.NA
         return cur, None
 
     prev = get_holdings_for_quarter(conn, prior, tickers)
+
     key = ["ticker", "cusip", "manager_cik", "manager_name"]
     cur2 = cur.merge(prev[key + ["shares", "value_usd"]], on=key, how="left", suffixes=("", "_prev"))
+
+    # Coerce again post-merge (prev columns can come in as object)
+    cur2 = coerce_numeric_cols(cur2, ["shares", "value_usd", "shares_prev", "value_usd_prev"])
+
     cur2["shares_change"] = cur2["shares"] - cur2["shares_prev"]
     cur2["value_change"] = cur2["value_usd"] - cur2["value_usd_prev"]
     return cur2, prior
@@ -451,33 +465,32 @@ def compute_changes_since_prior(conn: sqlite3.Connection, quarter_end: str, tick
 # STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="SEC 13F Ownership Tracker (Data.gov index)", layout="wide")
+st.set_page_config(page_title="SEC 13F Ownership Tracker (Data.gov)", layout="wide")
 st.title("Institutional Ownership Tracker — SEC 13F (Data.gov index, no Yahoo)")
 st.caption(
-    "Discovers SEC Form 13F dataset ZIPs via Data.gov, then ingests holdings from the ZIPs. "
-    "Includes Quarter Selector, Manager Selector, and Change Since Last Quarter."
+    "Discovers SEC Form 13F dataset ZIPs via Data.gov, ingests holdings from ZIP TSVs, "
+    "and provides Quarter Selector, Manager Selector, and Change Since Last Quarter."
 )
 
-# --- Secrets-backed contact info (recommended) ---
-# In Streamlit Cloud -> App -> Settings -> Secrets, set:
+# Secrets-backed contact info (Streamlit Cloud -> Settings -> Secrets)
 # SEC_CONTACT_EMAIL="you@domain.com"
-# SEC_APP_NAME="YourAppName"
-sec_email_secret = st.secrets.get("matthew.kolakowski@yahoo.com", "")
+# SEC_APP_NAME="FollowTheHealthInsuranceMoney"
+sec_email_secret = st.secrets.get("SEC_CONTACT_EMAIL", "")
 sec_app_secret = st.secrets.get("SEC_APP_NAME", "FollowTheHealthInsuranceMoney")
 
 st.sidebar.header("Controls")
+
 db_path = st.sidebar.text_input("SQLite DB Path", DB_PATH_DEFAULT)
 conn = db_connect(db_path)
 db_init(conn)
 
-st.sidebar.subheader("SEC Contact (from secrets)")
-st.sidebar.caption("Set these in Streamlit Cloud Secrets to avoid typing them in the UI.")
+st.sidebar.subheader("SEC Contact (secrets preferred)")
 app_name = st.sidebar.text_input("App name", value=sec_app_secret)
-contact_email = st.sidebar.text_input("Contact email", value=sec_email_secret, help="Used only in request headers for SEC ZIP downloads.")
+contact_email = st.sidebar.text_input("Contact email", value=sec_email_secret)
 
 if not contact_email or "@" not in contact_email:
     st.sidebar.warning(
-        "Add a real email in Streamlit Secrets:\n\n"
+        "Set Streamlit Secrets:\n"
         "SEC_CONTACT_EMAIL = \"you@domain.com\"\n"
         "SEC_APP_NAME = \"FollowTheHealthInsuranceMoney\""
     )
@@ -498,7 +511,6 @@ if st.sidebar.toggle("Add a custom tag rule"):
     if new_tag and new_pat:
         tag_rules.append((new_tag, new_pat))
 
-# Quarter list from Data.gov
 with st.sidebar.expander("Available 13F datasets (via Data.gov)", expanded=False):
     try:
         avail = fetch_available_quarters_from_datagov()
@@ -507,7 +519,6 @@ with st.sidebar.expander("Available 13F datasets (via Data.gov)", expanded=False
         avail = []
         st.error(f"Could not fetch Data.gov dataset list: {e}")
 
-# Ingestion controls
 st.sidebar.subheader("Ingestion")
 if avail:
     avail_labels = [a[0] for a in avail]
@@ -521,27 +532,25 @@ ingest_btn = st.sidebar.button("Ingest selected quarter")
 if ingest_btn:
     if not ingest_row:
         st.sidebar.error("No dataset selected / available.")
+    elif not contact_email or "@" not in contact_email:
+        st.sidebar.error("Set SEC_CONTACT_EMAIL in Streamlit Secrets (or enter a real email above).")
     else:
-        if not contact_email or "@" not in contact_email:
-            st.sidebar.error("Set SEC_CONTACT_EMAIL in Streamlit Secrets (or enter a real email above).")
+        q_label, q_url, q_end = ingest_row
+        with st.spinner("Downloading + ingesting 13F dataset ZIP (can take a few minutes)…"):
+            meta = ingest_13f_quarter(
+                conn=conn,
+                quarter_label=q_label,
+                quarter_end_hint=q_end,
+                zip_url=q_url,
+                tickers=selected_tickers,
+                app_name=app_name,
+                email=contact_email,
+            )
+        if meta.ingest_ok:
+            st.sidebar.success(f"Ingested: {q_label}")
         else:
-            q_label, q_url, q_end = ingest_row
-            with st.spinner("Downloading + ingesting 13F dataset ZIP (can take a few minutes)…"):
-                meta = ingest_13f_quarter(
-                    conn=conn,
-                    quarter_label=q_label,
-                    quarter_end_hint=q_end,
-                    zip_url=q_url,
-                    tickers=selected_tickers,
-                    app_name=app_name,
-                    email=contact_email,
-                )
-            if meta.ingest_ok:
-                st.sidebar.success(f"Ingested: {q_label}")
-            else:
-                st.sidebar.error(f"Ingest failed: {meta.error}")
+            st.sidebar.error(f"Ingest failed: {meta.error}")
 
-# Tabs
 tab_overview, tab_company, tab_manager, tab_data, tab_debug = st.tabs(
     ["Overview", "Company Detail", "Manager View", "Data / Exports", "Debug"]
 )
@@ -553,14 +562,13 @@ if loaded_ok.empty:
     st.info("No ingested 13F data yet. Use the sidebar to ingest the latest quarter dataset.")
     st.stop()
 
-# Quarter selector
+# Quarter Selector
 quarter_options = loaded_ok.sort_values("quarter_end", ascending=False)["quarter_end"].tolist()
 quarter_end = st.sidebar.selectbox("Quarter Selector (quarter_end)", options=quarter_options, index=0)
 
-# Current holdings + changes vs prior quarter
 holdings_cur, prior_q = compute_changes_since_prior(conn, quarter_end, selected_tickers)
 
-# Manager selector
+# Manager Selector
 manager_list = sorted(holdings_cur["manager_name"].dropna().unique().tolist())
 manager_choice = st.sidebar.selectbox("Manager Selector", options=["All managers"] + manager_list, index=0)
 
@@ -569,10 +577,20 @@ if manager_choice != "All managers":
 else:
     holdings_view = holdings_cur.copy()
 
+# --- Robust numeric coercion to prevent dtype object errors ---
+holdings_view = coerce_numeric_cols(
+    holdings_view,
+    ["shares", "value_usd", "shares_prev", "value_usd_prev", "shares_change", "value_change"],
+)
+
 holdings_view["tags"] = holdings_view["manager_name"].apply(lambda x: ", ".join(apply_tags(str(x), tag_rules)))
+
 holdings_view["value_usd_m"] = (holdings_view["value_usd"] / 1_000_000.0).round(2)
+
 if "value_change" in holdings_view.columns:
     holdings_view["value_change_m"] = (holdings_view["value_change"] / 1_000_000.0).round(2)
+else:
+    holdings_view["value_change_m"] = pd.NA
 
 # ------------------------------------------------------------
 # OVERVIEW
@@ -619,10 +637,10 @@ with tab_company:
     ticker = st.selectbox("Choose a company", options=selected_tickers, index=0)
 
     company_cur = holdings_cur[holdings_cur["ticker"] == ticker].copy()
+    company_cur = coerce_numeric_cols(company_cur, ["shares", "value_usd", "shares_change", "value_change"])
     company_cur["tags"] = company_cur["manager_name"].apply(lambda x: ", ".join(apply_tags(str(x), tag_rules)))
     company_cur["value_usd_m"] = (company_cur["value_usd"] / 1_000_000.0).round(2)
-    if "value_change" in company_cur.columns:
-        company_cur["value_change_m"] = (company_cur["value_change"] / 1_000_000.0).round(2)
+    company_cur["value_change_m"] = (company_cur["value_change"] / 1_000_000.0).round(2)
 
     st.markdown("### Current quarter top holders (by value)")
     company_top = company_cur.sort_values("value_usd", ascending=False).head(30)
@@ -642,6 +660,7 @@ with tab_company:
         conn,
         params=[ticker],
     )
+    hist = coerce_numeric_cols(hist, ["shares", "value_usd"])
     hist["value_usd_m"] = hist["value_usd"] / 1_000_000.0
 
     managers = sorted(hist["manager_name"].dropna().unique().tolist())
@@ -669,9 +688,9 @@ with tab_manager:
         st.info("Use the sidebar Manager Selector to pick a specific manager.")
     else:
         inv = holdings_cur[holdings_cur["manager_name"] == manager_choice].copy()
+        inv = coerce_numeric_cols(inv, ["shares", "value_usd", "shares_change", "value_change"])
         inv["value_usd_m"] = (inv["value_usd"] / 1_000_000.0).round(2)
-        if "value_change" in inv.columns:
-            inv["value_change_m"] = (inv["value_change"] / 1_000_000.0).round(2)
+        inv["value_change_m"] = (inv["value_change"] / 1_000_000.0).round(2)
 
         st.markdown(f"### {manager_choice} — quarter {quarter_end}")
         st.dataframe(
@@ -721,7 +740,6 @@ with tab_data:
 with tab_debug:
     st.subheader("Debug / Diagnostics")
 
-    st.markdown("### Pipeline state")
     st.write(
         {
             "quarter_end_selected": quarter_end,
@@ -731,6 +749,7 @@ with tab_debug:
             "manager_filter": manager_choice,
             "rows_in_view": int(len(holdings_view)),
             "sec_contact_email_set": bool(contact_email and "@" in contact_email),
+            "dtypes": {c: str(holdings_view[c].dtype) for c in holdings_view.columns if c in ["shares", "value_usd", "shares_change", "value_change"]},
         }
     )
 
