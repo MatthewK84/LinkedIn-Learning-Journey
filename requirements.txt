@@ -1,12 +1,8 @@
 # Dependencies
-streamlit>=1.32.0
-pandas>=2.1.4
 numpy>=1.26.3
 yfinance>=0.2.37
 matplotlib>=3.8.2
 plotly>=5.18.0
-requests>=2.31.0
-lxml>=4.9.3
 pymavlink>=2.4.47
 ijson>=3.3.0
 indexed-gzip>=1.9.5
@@ -25,3 +21,11 @@ pillow>=10.0.0
 
 # Geographic Components
 pyproj>=3.6.0
+
+#Health Insurance Apps
+streamlit>=1.31
+pandas>=2.1
+requests>=2.31
+lxml>=5.0
+html5lib>=1.1
+beautifulsoup4>=4.12.2
