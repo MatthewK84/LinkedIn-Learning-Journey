@@ -1,5 +1,8 @@
+import io
+import os
 import re
 import sqlite3
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +26,23 @@ DEFAULT_COMPANIES = {
     "Cardinal Health": "CAH",
 }
 
+# 13F infotable uses CUSIP (9 chars). This avoids Yahoo entirely.
+# Sources:
+# - UNH 91324P102 (StockAnalysis/QuantumOnline)
+# - ELV 036752103 (StockAnalysis)
+# - CVS 126650100 (SEC filing/StockAnalysis)
+# - MCK 58155Q103 (StockAnalysis/SEC filing)
+# - COR 03073E105 (SEC filing - legacy AmerisourceBergen; still common-stock CUSIP widely used)
+# - CAH 14149Y108 (Cardinal Health IR/StockAnalysis)
+TICKER_TO_CUSIP = {
+    "UNH": "91324P102",
+    "ELV": "036752103",
+    "CVS": "126650100",
+    "MCK": "58155Q103",
+    "COR": "03073E105",
+    "CAH": "14149Y108",
+}
+
 DEFAULT_TAG_RULES = [
     ("Vanguard", r"\bVanguard\b"),
     ("BlackRock", r"\bBlackRock\b|\bBlackrock\b"),
@@ -35,38 +55,21 @@ DEFAULT_TAG_RULES = [
     ("Index Fund/ETF (Generic)", r"\bIndex\b|\bETF\b"),
 ]
 
-DB_PATH_DEFAULT = "ownership_snapshots.sqlite"
+DB_PATH_DEFAULT = "ownership_13f.sqlite"
 
-# Primary (reliable) JSON endpoint (no scraping)
-YAHOO_QUOTE_SUMMARY_URL = (
-    "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-    "?modules=institutionOwnership,fundOwnership,majorHoldersBreakdown&formatted=false"
-)
-
-# Backup (HTML holders page) - may be blocked on Streamlit Cloud but kept as fallback
-YAHOO_HOLDERS_URL = "https://finance.yahoo.com/quote/{ticker}/holders/"
-
-# Backup cookie/crumb helpers (for when Yahoo requires a session handshake)
-YAHOO_HOME_URL = "https://finance.yahoo.com/"
-YAHOO_CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
-
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-
+SEC_13F_DATASETS_PAGE = "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets"
+SEC_DOWNLOAD_DIR = "sec_cache"  # local cache directory for zips
 
 # ============================================================
 # DATA MODEL
 # ============================================================
 
 @dataclass
-class SnapshotMeta:
+class IngestMeta:
     asof_utc: str
-    ticker: str
-    source: str
-    fetch_ok: int
+    quarter_label: str
+    zip_url: str
+    ingest_ok: int
     error: Optional[str] = None
 
 
@@ -84,34 +87,45 @@ def db_connect(db_path: str) -> sqlite3.Connection:
 def db_init(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS snapshot_meta (
-            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS quarter_meta (
+            quarter_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quarter_label TEXT NOT NULL,
+            quarter_end TEXT,
+            zip_url TEXT NOT NULL,
             asof_utc TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            source TEXT NOT NULL,
-            fetch_ok INTEGER NOT NULL,
+            ingest_ok INTEGER NOT NULL,
             error TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS holder_rows (
-            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_id INTEGER NOT NULL,
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_quarter_meta_label
+        ON quarter_meta(quarter_label);
+
+        -- Canonical holdings derived from 13F infotable + coverpage/submission joins
+        CREATE TABLE IF NOT EXISTS holdings_13f (
+            holding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quarter_end TEXT NOT NULL,
+            quarter_label TEXT NOT NULL,
             ticker TEXT NOT NULL,
-            table_name TEXT NOT NULL,
-            holder TEXT,
+            cusip TEXT NOT NULL,
+            manager_cik TEXT,
+            manager_name TEXT NOT NULL,
             shares REAL,
-            reported_date TEXT,
-            pct_out REAL,
-            value_usd REAL,
-            raw_json TEXT,
-            FOREIGN KEY(snapshot_id) REFERENCES snapshot_meta(snapshot_id) ON DELETE CASCADE
+            value_usd REAL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_holder_rows_ticker_table
-        ON holder_rows(ticker, table_name);
+        CREATE INDEX IF NOT EXISTS idx_holdings_qtr_ticker
+        ON holdings_13f(quarter_end, ticker);
 
-        CREATE INDEX IF NOT EXISTS idx_snapshot_meta_ticker_time
-        ON snapshot_meta(ticker, asof_utc);
+        CREATE INDEX IF NOT EXISTS idx_holdings_qtr_manager
+        ON holdings_13f(quarter_end, manager_name);
+
+        -- Optional: keep a mapping of accession -> manager/period (debug/traceability)
+        CREATE TABLE IF NOT EXISTS accession_map (
+            accession_number TEXT PRIMARY KEY,
+            period_of_report TEXT,
+            manager_cik TEXT,
+            manager_name TEXT
+        );
         """
     )
     conn.commit()
@@ -120,36 +134,6 @@ def db_init(conn: sqlite3.Connection) -> None:
 # ============================================================
 # UTILS
 # ============================================================
-
-def _to_number(x) -> Optional[float]:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return None
-    s = str(x).strip()
-    if s in ("", "—", "-", "N/A", "nan"):
-        return None
-    s = s.replace(",", "")
-    if s.endswith("%"):
-        try:
-            return float(s[:-1]) / 100.0
-        except Exception:
-            return None
-    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMBT])?$", s, re.IGNORECASE)
-    if m:
-        val = float(m.group(1))
-        suf = (m.group(2) or "").upper()
-        mult = {"": 1, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suf, 1)
-        return val * mult
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
 
 def apply_tags(holder_name: str, custom_rules: List[Tuple[str, str]]) -> List[str]:
     tags: List[str] = []
@@ -161,654 +145,657 @@ def apply_tags(holder_name: str, custom_rules: List[Tuple[str, str]]) -> List[st
     return tags
 
 
-def _epoch_to_date(x) -> Optional[str]:
-    try:
-        if x is None:
-            return None
-        return datetime.fromtimestamp(int(x), tz=timezone.utc).date().isoformat()
-    except Exception:
-        return None
-
-
-def _headers() -> Dict[str, str]:
+def sec_headers(app_name: str, email: str) -> Dict[str, str]:
+    """
+    SEC asks automated clients to identify themselves with a real contact.
+    Put your real email in the sidebar input.
+    """
+    ua = f"{app_name} ({email})" if email else app_name
     return {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": ua,
+        "Accept-Encoding": "gzip, deflate, br",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
     }
 
 
-# ============================================================
-# COOKIE / CRUMB (BACKUP STRATEGY)
-# ============================================================
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)  # cache 6 hours
-def get_yahoo_session_and_crumb() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Best-effort: create a Yahoo session (cookies) + fetch crumb.
-    This sometimes helps with endpoints that behave differently without a prior web session.
 
-    Returns: (cookie_header, crumb)
-      - cookie_header: a string like "A3=...; B=...; ...", suitable for a "Cookie" header
-      - crumb: crumb string (not always needed for quoteSummary, but useful for other Yahoo endpoints)
+def parse_sec_dataset_links(html: str) -> List[Tuple[str, str]]:
     """
-    sess = requests.Session()
+    Returns list of (label, zip_url).
+    """
+    # The SEC page contains anchors whose href ends with _form13f.zip
+    # Example: https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01jun2025-31aug2025_form13f.zip
+    zip_urls = sorted(set(re.findall(r"https://www\.sec\.gov/files/structureddata/data/form-13f-data-sets/[^\"']+_form13f\.zip", html)))
+    pairs: List[Tuple[str, str]] = []
+    for u in zip_urls:
+        fname = u.rsplit("/", 1)[-1]
+        label = fname.replace("_form13f.zip", "").replace("-", " - ")
+        pairs.append((label, u))
+    # Newest tend to appear last alphabetically, but not guaranteed; we’ll keep list and also store label.
+    return pairs
+
+
+def quarter_end_from_label(label: str) -> Optional[str]:
+    """
+    Best-effort derive quarter_end from filename label like:
+      '01jun2025 - 31aug2025'  -> 2025-08-31
+      '01sep2025 - 30nov2025'  -> 2025-11-30
+    """
+    m = re.search(r"(\d{2}[a-z]{3}\d{4})\s*-\s*(\d{2}[a-z]{3}\d{4})", label, flags=re.IGNORECASE)
+    if not m:
+        return None
+    end_s = m.group(2)
+    # Parse ddmonyyyy to YYYY-MM-DD
     try:
-        # 1) Hit home page to get baseline cookies
-        sess.get(YAHOO_HOME_URL, headers=_headers(), timeout=30, allow_redirects=True)
-
-        # 2) Get crumb (requires cookies)
-        r = sess.get(YAHOO_CRUMB_URL, headers=_headers(), timeout=30, allow_redirects=True)
-        if r.status_code != 200:
-            # Still return cookies; crumb may be blocked
-            cookie_header = "; ".join([f"{k}={v}" for k, v in sess.cookies.get_dict().items()]) or None
-            return cookie_header, None
-
-        crumb = (r.text or "").strip() or None
-        cookie_header = "; ".join([f"{k}={v}" for k, v in sess.cookies.get_dict().items()]) or None
-        return cookie_header, crumb
-
+        dt = datetime.strptime(end_s, "%d%b%Y").date()
+        return dt.isoformat()
     except Exception:
-        return None, None
+        return None
 
 
 # ============================================================
-# FETCHERS
+# SEC: LIST AVAILABLE QUARTERS
 # ============================================================
 
-def _parse_quote_summary_json(js: dict) -> Dict[str, pd.DataFrame]:
-    result = (js.get("quoteSummary") or {}).get("result")
-    if not result:
-        return {}
-
-    root = result[0]
-    tables: Dict[str, pd.DataFrame] = {}
-
-    # Major Holders Breakdown (dict-ish)
-    mhb = root.get("majorHoldersBreakdown") or {}
-    if mhb:
-        mhb_rows = [{"Breakdown": k, "Value": v} for k, v in mhb.items()]
-        tables["Major Holders"] = pd.DataFrame(mhb_rows)
-
-    # Institutional holders list
-    inst = (root.get("institutionOwnership") or {}).get("ownershipList") or []
-    if inst:
-        inst_rows = []
-        for it in inst:
-            inst_rows.append(
-                {
-                    "holder": it.get("organization"),
-                    "shares": _to_number(it.get("position")),
-                    "reported_date": _epoch_to_date(it.get("reportDate")),
-                    "pct_out": _to_number(it.get("pctHeld")),
-                    "value_usd": _to_number(it.get("value")),
-                }
-            )
-        tables["Top Holders (Detail)"] = pd.DataFrame(inst_rows)
-
-    # Mutual fund holders list (kept separate)
-    fund = (root.get("fundOwnership") or {}).get("ownershipList") or []
-    if fund:
-        fund_rows = []
-        for it in fund:
-            fund_rows.append(
-                {
-                    "holder": it.get("organization"),
-                    "shares": _to_number(it.get("position")),
-                    "reported_date": _epoch_to_date(it.get("reportDate")),
-                    "pct_out": _to_number(it.get("pctHeld")),
-                    "value_usd": _to_number(it.get("value")),
-                }
-            )
-        tables["Top Mutual Fund Holders (Detail)"] = pd.DataFrame(fund_rows)
-
-    return tables
-
-
-def fetch_quote_summary(ticker: str, cookie_header: Optional[str] = None) -> Tuple[int, Optional[str], Dict[str, pd.DataFrame]]:
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def fetch_available_quarters(app_name: str, email: str) -> List[Tuple[str, str, Optional[str]]]:
     """
-    Primary strategy: JSON quoteSummary endpoint.
-    Returns: (http_status, error, tables)
+    Returns list of (quarter_label, zip_url, quarter_end_iso)
     """
-    url = YAHOO_QUOTE_SUMMARY_URL.format(ticker=ticker)
-    headers = _headers()
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-
-    try:
-        r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-        if r.status_code != 200:
-            return r.status_code, f"HTTP {r.status_code} {url}", {}
-        js = r.json()
-        tables = _parse_quote_summary_json(js)
-        if not tables:
-            err = (js.get("quoteSummary") or {}).get("error")
-            return r.status_code, f"No tables in JSON. error={err}", {}
-        return r.status_code, None, tables
-    except Exception as e:
-        return 0, str(e), {}
+    r = requests.get(SEC_13F_DATASETS_PAGE, headers=sec_headers(app_name, email), timeout=60)
+    r.raise_for_status()
+    pairs = parse_sec_dataset_links(r.text)
+    out = []
+    for label, url in pairs:
+        out.append((label, url, quarter_end_from_label(label)))
+    # Prefer newest first by quarter_end if present
+    out.sort(key=lambda x: (x[2] or ""), reverse=True)
+    return out
 
 
-def fetch_holders_html(ticker: str, cookie_header: Optional[str] = None) -> Tuple[int, Optional[str], Dict[str, pd.DataFrame]]:
+# ============================================================
+# SEC: DOWNLOAD + INGEST 13F ZIP
+# ============================================================
+
+def _zip_cache_path(quarter_label: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", quarter_label)
+    return os.path.join(SEC_DOWNLOAD_DIR, f"{safe}.zip")
+
+
+def download_zip_if_needed(zip_url: str, quarter_label: str, app_name: str, email: str) -> str:
     """
-    Backup strategy: scrape HTML holders page (often blocked on hosted envs).
-    Returns: (http_status, error, tables)
+    Returns local path to zip (cached on disk).
     """
-    url = YAHOO_HOLDERS_URL.format(ticker=ticker)
-    headers = _headers()
-    if cookie_header:
-        headers["Cookie"] = cookie_header
+    ensure_dir(SEC_DOWNLOAD_DIR)
+    path = _zip_cache_path(quarter_label)
+    if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+        return path
 
-    try:
-        r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-        if r.status_code != 200:
-            return r.status_code, f"HTTP {r.status_code} {url}", {}
-
-        tables = pd.read_html(r.text)
-        if not tables:
-            return r.status_code, "No HTML tables found (blocked/consent/bot page likely).", {}
-
-        out: Dict[str, pd.DataFrame] = {}
-        for t in tables:
-            t = _clean_columns(t)
-            cols = set([c.lower() for c in t.columns])
-
-            if len(t.columns) == 2 and ("breakdown" in cols or "value" in cols):
-                out.setdefault("Major Holders", t)
-
-            if {"holder", "shares", "date reported"}.issubset(cols):
-                out.setdefault("Top Holders (Detail)", t)
-
-        if not out:
-            return r.status_code, "Tables found, but none matched expected holder schemas.", {}
-
-        return r.status_code, None, out
-
-    except Exception as e:
-        return 0, str(e), {}
+    with requests.get(zip_url, headers=sec_headers(app_name, email), stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    return path
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_holders_tables_with_fallbacks(ticker: str) -> Tuple[SnapshotMeta, Dict[str, pd.DataFrame]]:
+def _find_member(z: zipfile.ZipFile, table_prefix: str) -> Optional[str]:
     """
-    Full strategy:
-      1) quoteSummary JSON (no cookies)
-      2) quoteSummary JSON with cookie/crumb session (best-effort)
-      3) HTML holders scrape with cookie/crumb session (last resort)
+    Finds member like 'INFOTABLE.tsv' or 'COVERPAGE.tsv' regardless of case or folder.
+    """
+    names = z.namelist()
+    # SEC doc says: SUBMISSION, COVERPAGE, INFOTABLE etc. TSV, tab-delimited UTF-8
+    for n in names:
+        base = n.rsplit("/", 1)[-1]
+        if base.upper().startswith(table_prefix.upper()) and base.lower().endswith(".tsv"):
+            return n
+    return None
+
+
+def ingest_13f_quarter(
+    conn: sqlite3.Connection,
+    quarter_label: str,
+    quarter_end: Optional[str],
+    zip_url: str,
+    tickers: List[str],
+    app_name: str,
+    email: str,
+) -> IngestMeta:
+    """
+    Ingests SEC 13F dataset ZIP into holdings_13f table for specified tickers.
+    Uses:
+      SUBMISSION.tsv: accession_number, cik, periodofreport
+      COVERPAGE.tsv: accession_number, filingmanager_name
+      INFOTABLE.tsv: accession_number, cusip, sshprnamt, value
     """
     asof = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cusips = {TICKER_TO_CUSIP[t] for t in tickers if t in TICKER_TO_CUSIP}
 
-    # 1) JSON without cookies
-    status, err, tables = fetch_quote_summary(ticker, cookie_header=None)
-    if tables:
-        return SnapshotMeta(asof, ticker, "yahoo_quoteSummary", 1, None), tables
+    try:
+        local_zip = download_zip_if_needed(zip_url, quarter_label, app_name, email)
 
-    # 2) JSON with cookie/crumb
-    cookie_header, crumb = get_yahoo_session_and_crumb()
-    status2, err2, tables2 = fetch_quote_summary(ticker, cookie_header=cookie_header)
-    if tables2:
-        note = None
-        # keep a breadcrumb in error field? no; store nothing when success
-        return SnapshotMeta(asof, ticker, "yahoo_quoteSummary_cookie", 1, note), tables2
+        with zipfile.ZipFile(local_zip, "r") as z:
+            sub_m = _find_member(z, "SUBMISSION")
+            cov_m = _find_member(z, "COVERPAGE")
+            info_m = _find_member(z, "INFOTABLE")
 
-    # 3) HTML last-resort (often fails on hosted env, but sometimes works)
-    status3, err3, tables3 = fetch_holders_html(ticker, cookie_header=cookie_header)
-    if tables3:
-        return SnapshotMeta(asof, ticker, "yahoo_html_cookie", 1, None), tables3
+            if not (sub_m and cov_m and info_m):
+                missing = [k for k, v in [("SUBMISSION", sub_m), ("COVERPAGE", cov_m), ("INFOTABLE", info_m)] if not v]
+                raise RuntimeError(f"Missing TSV(s) in ZIP: {missing}")
 
-    # Failure: keep the most informative error
-    final_err = f"quoteSummary(no-cookie): {err} | quoteSummary(cookie/crumb={bool(crumb)}): {err2} | html(cookie/crumb={bool(crumb)}): {err3}"
-    return SnapshotMeta(asof, ticker, "yahoo_fallbacks", 0, final_err), {}
+            # ---- Read SUBMISSION (accession -> cik, period)
+            with z.open(sub_m) as fsub:
+                sub = pd.read_csv(
+                    fsub,
+                    sep="\t",
+                    dtype=str,
+                    usecols=["ACCESSION_NUMBER", "CIK", "PERIODOFREPORT"],
+                    low_memory=False,
+                )
+            sub.columns = [c.strip().upper() for c in sub.columns]
+            sub = sub.rename(columns={"ACCESSION_NUMBER": "accession_number", "CIK": "manager_cik", "PERIODOFREPORT": "period_of_report"})
 
+            # Normalize period format if it’s DD-MON-YYYY
+            def _norm_period(x: str) -> str:
+                if not isinstance(x, str) or not x:
+                    return ""
+                x = x.strip()
+                for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(x, fmt).date().isoformat()
+                    except Exception:
+                        pass
+                return x  # keep raw
 
-# ============================================================
-# PERSISTENCE
-# ============================================================
+            sub["period_of_report"] = sub["period_of_report"].apply(_norm_period)
 
-def persist_snapshot(conn: sqlite3.Connection, meta: SnapshotMeta, tables: Dict[str, pd.DataFrame]) -> int:
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO snapshot_meta (asof_utc, ticker, source, fetch_ok, error) VALUES (?, ?, ?, ?, ?)",
-        (meta.asof_utc, meta.ticker, meta.source, meta.fetch_ok, meta.error),
-    )
-    snapshot_id = cur.lastrowid
+            # ---- Read COVERPAGE (accession -> manager_name)
+            with z.open(cov_m) as fcov:
+                cov = pd.read_csv(
+                    fcov,
+                    sep="\t",
+                    dtype=str,
+                    usecols=["ACCESSION_NUMBER", "FILINGMANAGER_NAME"],
+                    low_memory=False,
+                )
+            cov.columns = [c.strip().upper() for c in cov.columns]
+            cov = cov.rename(columns={"ACCESSION_NUMBER": "accession_number", "FILINGMANAGER_NAME": "manager_name"})
 
-    for table_name, df in tables.items():
-        if df is None or df.empty:
-            continue
+            # ---- Join accession map (for manager selector + auditing)
+            acc = sub.merge(cov, on="accession_number", how="inner")
+            acc["manager_name"] = acc["manager_name"].fillna("").str.strip()
+            acc = acc[acc["manager_name"] != ""].copy()
 
-        df_n = df.copy()
+            # Quarter end: if not provided, infer from the dominant period_of_report
+            inferred_qend = quarter_end
+            if not inferred_qend:
+                # most common period in this dataset
+                mode = acc["period_of_report"].mode()
+                inferred_qend = mode.iloc[0] if len(mode) else None
 
-        # Normalize if it's one of the detail tables already in canonical schema
-        if table_name in ("Top Holders (Detail)", "Top Mutual Fund Holders (Detail)"):
-            # Ensure canonical columns exist
-            cols = set([c.lower().strip() for c in df_n.columns])
-            # If coming from HTML, normalize via column mapping
-            if {"holder", "shares", "date reported"}.issubset(cols):
-                df_n = _clean_columns(df_n)
-                rename_map = {}
-                for c in df_n.columns:
-                    cl = c.lower().strip()
-                    if cl == "holder":
-                        rename_map[c] = "holder"
-                    elif cl == "shares":
-                        rename_map[c] = "shares"
-                    elif cl == "date reported":
-                        rename_map[c] = "reported_date"
-                    elif cl in ("% out", "%out", "pct out"):
-                        rename_map[c] = "pct_out"
-                    elif cl == "value":
-                        rename_map[c] = "value_usd"
-                df_n = df_n.rename(columns=rename_map)
-                keep = [c for c in ["holder", "shares", "reported_date", "pct_out", "value_usd"] if c in df_n.columns]
-                df_n = df_n[keep].copy()
-                if "shares" in df_n.columns:
-                    df_n["shares"] = df_n["shares"].apply(_to_number)
-                if "pct_out" in df_n.columns:
-                    df_n["pct_out"] = df_n["pct_out"].apply(_to_number)
-                if "value_usd" in df_n.columns:
-                    df_n["value_usd"] = df_n["value_usd"].apply(_to_number)
-                if "reported_date" in df_n.columns:
-                    df_n["reported_date"] = pd.to_datetime(df_n["reported_date"], errors="coerce").dt.date.astype(str)
+            if not inferred_qend:
+                inferred_qend = "UNKNOWN"
 
-        for _, row in df_n.iterrows():
-            holder = row.get("holder") if isinstance(row, pd.Series) else None
-            shares = row.get("shares") if isinstance(row, pd.Series) else None
-            reported_date = row.get("reported_date") if isinstance(row, pd.Series) else None
-            pct_out = row.get("pct_out") if isinstance(row, pd.Series) else None
-            value_usd = row.get("value_usd") if isinstance(row, pd.Series) else None
+            # Persist accession map (upsert)
+            cur = conn.cursor()
+            for _, r in acc.iterrows():
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO accession_map(accession_number, period_of_report, manager_cik, manager_name)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (r["accession_number"], r["period_of_report"], r.get("manager_cik"), r["manager_name"]),
+                )
+            conn.commit()
 
-            cur.execute(
-                """
-                INSERT INTO holder_rows
-                (snapshot_id, ticker, table_name, holder, shares, reported_date, pct_out, value_usd, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot_id,
-                    meta.ticker,
-                    table_name,
-                    None if (holder is None or (isinstance(holder, float) and pd.isna(holder))) else str(holder),
-                    None if shares is None or (isinstance(shares, float) and pd.isna(shares)) else float(shares),
-                    None if reported_date is None or reported_date == "NaT" else str(reported_date),
-                    None if pct_out is None or (isinstance(pct_out, float) and pd.isna(pct_out)) else float(pct_out),
-                    None if value_usd is None or (isinstance(value_usd, float) and pd.isna(value_usd)) else float(value_usd),
-                    None,
-                ),
+            # ---- Stream INFOTABLE and filter by CUSIP in chunks
+            # VALUE is market value in thousands of dollars per SEC doc.
+            chunks = []
+            with z.open(info_m) as finfo:
+                it = pd.read_csv(
+                    finfo,
+                    sep="\t",
+                    dtype=str,
+                    usecols=["ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT"],
+                    chunksize=250_000,
+                    low_memory=False,
+                )
+                for chunk in it:
+                    chunk.columns = [c.strip().upper() for c in chunk.columns]
+                    chunk = chunk.rename(
+                        columns={
+                            "ACCESSION_NUMBER": "accession_number",
+                            "CUSIP": "cusip",
+                            "VALUE": "value_k",
+                            "SSHPRNAMT": "shares",
+                        }
+                    )
+                    chunk["cusip"] = chunk["cusip"].astype(str).str.strip()
+                    chunk = chunk[chunk["cusip"].isin(cusips)].copy()
+                    if chunk.empty:
+                        continue
+                    # numeric coercion
+                    chunk["value_usd"] = pd.to_numeric(chunk["value_k"], errors="coerce") * 1000.0
+                    chunk["shares"] = pd.to_numeric(chunk["shares"], errors="coerce")
+                    chunks.append(chunk[["accession_number", "cusip", "shares", "value_usd"]])
+
+            if not chunks:
+                raise RuntimeError("No matching CUSIP rows found in INFOTABLE for selected tickers.")
+
+            info = pd.concat(chunks, ignore_index=True)
+            # join manager identity
+            info = info.merge(acc[["accession_number", "manager_cik", "manager_name"]], on="accession_number", how="left")
+            info = info[info["manager_name"].notna()].copy()
+
+            # Map cusip -> ticker
+            cusip_to_ticker = {v: k for k, v in TICKER_TO_CUSIP.items()}
+            info["ticker"] = info["cusip"].map(cusip_to_ticker)
+
+            # Aggregate by quarter_end + ticker + manager
+            agg = (
+                info.groupby(["ticker", "cusip", "manager_cik", "manager_name"], dropna=False)[["shares", "value_usd"]]
+                .sum()
+                .reset_index()
             )
+            agg["quarter_end"] = inferred_qend
+            agg["quarter_label"] = quarter_label
 
-    conn.commit()
-    return snapshot_id
+            # Delete prior ingests for this quarter_label to make it idempotent
+            conn.execute("DELETE FROM holdings_13f WHERE quarter_label = ?", (quarter_label,))
+            conn.commit()
+
+            # Insert
+            agg.to_sql("holdings_13f", conn, if_exists="append", index=False)
+
+            # Record quarter_meta
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO quarter_meta(quarter_label, quarter_end, zip_url, asof_utc, ingest_ok, error)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (quarter_label, inferred_qend, zip_url, asof, 1, None),
+            )
+            conn.commit()
+
+        return IngestMeta(asof, quarter_label, zip_url, 1, None)
+
+    except Exception as e:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO quarter_meta(quarter_label, quarter_end, zip_url, asof_utc, ingest_ok, error)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (quarter_label, quarter_end, zip_url, asof, 0, str(e)),
+        )
+        conn.commit()
+        return IngestMeta(asof, quarter_label, zip_url, 0, str(e))
 
 
-def load_latest_detail(conn: sqlite3.Connection, tickers: List[str]) -> pd.DataFrame:
-    q = """
-    WITH latest AS (
-        SELECT ticker, MAX(asof_utc) AS max_asof
-        FROM snapshot_meta
-        WHERE fetch_ok = 1
-        GROUP BY ticker
+# ============================================================
+# QUERY HELPERS (Quarter selector / Manager selector / Changes)
+# ============================================================
+
+def list_loaded_quarters(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """
+        SELECT quarter_label, quarter_end, zip_url, asof_utc, ingest_ok, error
+        FROM quarter_meta
+        ORDER BY quarter_end DESC
+        """,
+        conn,
     )
-    SELECT m.asof_utc, r.ticker, r.table_name, r.holder, r.shares, r.reported_date, r.pct_out, r.value_usd
-    FROM holder_rows r
-    JOIN snapshot_meta m ON m.snapshot_id = r.snapshot_id
-    JOIN latest l ON l.ticker = m.ticker AND l.max_asof = m.asof_utc
-    WHERE r.table_name IN ('Top Holders (Detail)', 'Top Mutual Fund Holders (Detail)')
-      AND r.holder IS NOT NULL
-      AND r.ticker IN ({})
-    """.format(",".join(["?"] * len(tickers)))
-    return pd.read_sql_query(q, conn, params=tickers)
 
 
-def load_history(conn: sqlite3.Connection, ticker: str) -> pd.DataFrame:
-    q = """
-    SELECT m.asof_utc, r.ticker, r.table_name, r.holder, r.shares, r.reported_date, r.pct_out, r.value_usd
-    FROM holder_rows r
-    JOIN snapshot_meta m ON m.snapshot_id = r.snapshot_id
-    WHERE m.fetch_ok = 1
-      AND r.table_name IN ('Top Holders (Detail)', 'Top Mutual Fund Holders (Detail)')
-      AND r.ticker = ?
-      AND r.holder IS NOT NULL
-    ORDER BY m.asof_utc ASC
+def get_holdings_for_quarter(conn: sqlite3.Connection, quarter_end: str, tickers: List[str]) -> pd.DataFrame:
+    q = f"""
+    SELECT quarter_end, quarter_label, ticker, cusip, manager_cik, manager_name, shares, value_usd
+    FROM holdings_13f
+    WHERE quarter_end = ?
+      AND ticker IN ({",".join(["?"] * len(tickers))})
     """
-    return pd.read_sql_query(q, conn, params=[ticker])
+    return pd.read_sql_query(q, conn, params=[quarter_end] + tickers)
+
+
+def get_prior_quarter_end(conn: sqlite3.Connection, quarter_end: str) -> Optional[str]:
+    df = pd.read_sql_query(
+        """
+        SELECT DISTINCT quarter_end
+        FROM holdings_13f
+        WHERE quarter_end < ?
+        ORDER BY quarter_end DESC
+        LIMIT 1
+        """,
+        conn,
+        params=[quarter_end],
+    )
+    if df.empty:
+        return None
+    return str(df["quarter_end"].iloc[0])
+
+
+def compute_changes_since_prior(conn: sqlite3.Connection, quarter_end: str, tickers: List[str]) -> Tuple[pd.DataFrame, Optional[str]]:
+    prior = get_prior_quarter_end(conn, quarter_end)
+    cur = get_holdings_for_quarter(conn, quarter_end, tickers)
+    if not prior:
+        cur["shares_change"] = None
+        cur["value_change"] = None
+        return cur, None
+
+    prev = get_holdings_for_quarter(conn, prior, tickers)
+    key = ["ticker", "cusip", "manager_cik", "manager_name"]
+    cur2 = cur.merge(prev[key + ["shares", "value_usd"]], on=key, how="left", suffixes=("", "_prev"))
+    cur2["shares_change"] = cur2["shares"] - cur2["shares_prev"]
+    cur2["value_change"] = cur2["value_usd"] - cur2["value_usd_prev"]
+    return cur2, prior
 
 
 # ============================================================
-# UI
+# STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="Ownership: Insurers + Wholesalers", layout="wide")
-
-st.title("Institutional Ownership Tracker — Big Insurers + Wholesalers")
+st.set_page_config(page_title="SEC 13F Ownership Tracker", layout="wide")
+st.title("Institutional Ownership Tracker — SEC 13F (No Yahoo)")
 st.caption(
-    "Pulls top holders via Yahoo quoteSummary JSON and stores snapshots locally (SQLite) so you can track changes over time."
+    "Computes largest institutional holders from SEC Form 13F datasets (quarterly). "
+    "This avoids Yahoo entirely and keeps a historical DB for trends + changes."
 )
 
-with st.expander("What this dashboard is answering (and how)", expanded=False):
-    st.markdown(
-        """
-**Question:** “Who are the biggest non-insider shareholders of the big 3 insurance companies and wholesalers?”
-
-This app:
-- Tracks major institutional / fund holders.
-- Highlights the “big three” asset managers (**Vanguard, BlackRock, State Street**) and tags pensions.
-- Stores timestamped snapshots (SQLite) so you can track changes over time.
-
-**Primary data method:** Yahoo `quoteSummary` JSON (more reliable than scraping HTML in hosted environments).
-**Backup method:** Cookie/crumb session + HTML scrape (last resort).
-        """
-    )
-
-# Sidebar
+# Sidebar controls
 st.sidebar.header("Controls")
 
 db_path = st.sidebar.text_input("SQLite DB Path", DB_PATH_DEFAULT)
 conn = db_connect(db_path)
 db_init(conn)
 
-companies = DEFAULT_COMPANIES.copy()
+st.sidebar.subheader("SEC Identification (required for reliable access)")
+app_name = st.sidebar.text_input("App name (User-Agent)", "FollowTheHealthInsuranceMoney")
+contact_email = st.sidebar.text_input("Contact email (User-Agent)", "")
 
 st.sidebar.subheader("Company Universe")
 selected_names = st.sidebar.multiselect(
     "Track these companies",
-    options=list(companies.keys()),
-    default=list(companies.keys()),
+    options=list(DEFAULT_COMPANIES.keys()),
+    default=list(DEFAULT_COMPANIES.keys()),
 )
-selected_tickers = [companies[n] for n in selected_names]
+selected_tickers = [DEFAULT_COMPANIES[n] for n in selected_names]
 
 st.sidebar.subheader("Investor Tag Rules")
 tag_rules = DEFAULT_TAG_RULES.copy()
 if st.sidebar.toggle("Add a custom tag rule"):
-    new_tag = st.sidebar.text_input("Tag name (e.g., 'My Watchlist')", "")
+    new_tag = st.sidebar.text_input("Tag name", "")
     new_pat = st.sidebar.text_input("Regex pattern (case-insensitive)", "")
     if new_tag and new_pat:
         tag_rules.append((new_tag, new_pat))
 
-st.sidebar.subheader("Data Updates")
-col_a, col_b = st.sidebar.columns(2)
-do_refresh = col_a.button("Refresh Now")
-show_raw = col_b.toggle("Show raw tables", value=False)
+# Fetch quarter list from SEC
+with st.sidebar.expander("Available SEC 13F quarters", expanded=False):
+    try:
+        avail = fetch_available_quarters(app_name, contact_email)
+        st.write(f"Found {len(avail)} downloadable datasets.")
+    except Exception as e:
+        avail = []
+        st.error(f"Could not fetch SEC datasets list: {e}")
 
-if do_refresh:
-    with st.spinner("Fetching holders and saving snapshot(s)…"):
-        for t in selected_tickers:
-            meta, tables = fetch_holders_tables_with_fallbacks(t)
-            persist_snapshot(conn, meta, tables)
-    st.success("Refresh complete. Snapshots saved.")
+# Ingest controls
+st.sidebar.subheader("Ingestion")
+if avail:
+    avail_labels = [a[0] for a in avail]
+    default_label = avail_labels[0]
+    ingest_label = st.sidebar.selectbox("Choose dataset to ingest", options=avail_labels, index=0)
+    ingest_row = next((a for a in avail if a[0] == ingest_label), None)
+else:
+    ingest_label, ingest_row = None, None
 
-# Auto-refresh once per session if DB is empty
-if "auto_refreshed" not in st.session_state:
-    cnt = pd.read_sql_query("SELECT COUNT(*) AS n FROM snapshot_meta", conn)["n"].iloc[0]
-    if cnt == 0:
-        for t in selected_tickers:
-            meta, tables = fetch_holders_tables_with_fallbacks(t)
-            persist_snapshot(conn, meta, tables)
-    st.session_state["auto_refreshed"] = True
+ingest_btn = st.sidebar.button("Ingest selected quarter")
 
-tab_overview, tab_company, tab_investor, tab_data, tab_debug = st.tabs(
-    ["Overview", "Company Detail", "Investor View", "Data / Exports", "Debug"]
+if ingest_btn:
+    if not ingest_row:
+        st.sidebar.error("No dataset selected / available.")
+    else:
+        q_label, q_url, q_end = ingest_row
+        with st.spinner("Downloading + ingesting SEC 13F dataset (this can take a few minutes)…"):
+            meta = ingest_13f_quarter(
+                conn=conn,
+                quarter_label=q_label,
+                quarter_end=q_end,
+                zip_url=q_url,
+                tickers=selected_tickers,
+                app_name=app_name,
+                email=contact_email,
+            )
+        if meta.ingest_ok:
+            st.sidebar.success(f"Ingested: {q_label}")
+        else:
+            st.sidebar.error(f"Ingest failed: {meta.error}")
+
+# Tabs
+tab_overview, tab_company, tab_manager, tab_data, tab_debug = st.tabs(
+    ["Overview", "Company Detail", "Manager View", "Data / Exports", "Debug"]
 )
 
 # -----------------------------
-# Overview
+# Quarter selector (global)
+# -----------------------------
+loaded = list_loaded_quarters(conn)
+loaded_ok = loaded[(loaded["ingest_ok"] == 1) & (loaded["quarter_end"].notna())].copy()
+
+if loaded_ok.empty:
+    st.info("No ingested SEC 13F data yet. Use the sidebar to ingest the latest quarter dataset.")
+    st.stop()
+
+# Quarter selector
+quarter_options = loaded_ok.sort_values("quarter_end", ascending=False)["quarter_end"].tolist()
+quarter_end = st.sidebar.selectbox("Quarter Selector (quarter_end)", options=quarter_options, index=0)
+
+# Pull holdings for current quarter + compute changes since prior
+holdings_cur, prior_q = compute_changes_since_prior(conn, quarter_end, selected_tickers)
+
+# Manager selector options based on current quarter + selected universe
+manager_list = sorted(holdings_cur["manager_name"].dropna().unique().tolist())
+manager_choice = st.sidebar.selectbox("Manager Selector", options=["All managers"] + manager_list, index=0)
+
+if manager_choice != "All managers":
+    holdings_view = holdings_cur[holdings_cur["manager_name"] == manager_choice].copy()
+else:
+    holdings_view = holdings_cur.copy()
+
+# Add tags + helpful display fields
+holdings_view["tags"] = holdings_view["manager_name"].apply(lambda x: ", ".join(apply_tags(str(x), tag_rules)))
+holdings_view["value_usd_m"] = (holdings_view["value_usd"] / 1_000_000.0).round(2)
+if "value_change" in holdings_view.columns:
+    holdings_view["value_change_m"] = (holdings_view["value_change"] / 1_000_000.0).round(2)
+
+
+# -----------------------------
+# Overview tab
 # -----------------------------
 with tab_overview:
-    st.subheader("Latest snapshot — cross-company view")
+    st.subheader("Top institutional holders (SEC 13F)")
 
-    latest = load_latest_detail(conn, selected_tickers)
-    if latest.empty:
-        st.info("No data yet. Click **Refresh Now** in the sidebar.")
+    if prior_q:
+        st.caption(f"Quarter: **{quarter_end}** (changes vs prior quarter **{prior_q}**).")
     else:
-        latest["tags"] = latest["holder"].apply(lambda x: ", ".join(apply_tags(x, tag_rules)))
-        latest["pct_out_display"] = (latest["pct_out"] * 100.0).round(3)
+        st.caption(f"Quarter: **{quarter_end}** (no prior quarter loaded to compute changes).")
 
-        c1, c2 = st.columns([2, 1])
+    # Top holders per company by value
+    topn = st.slider("Top N managers per company", 5, 50, 15, 5)
 
-        with c2:
-            st.markdown("### Concentration quick check")
-            big3 = latest[
-                latest["tags"].str.contains("Vanguard|BlackRock|State Street", regex=True, na=False)
-            ].copy()
-            if not big3.empty and latest["pct_out"].notna().any():
-                conc = (
-                    big3.groupby("ticker")["pct_out"]
-                    .sum()
-                    .reset_index()
-                    .rename(columns={"pct_out": "big3_pct_out"})
-                )
-                conc["big3_pct_out"] = (conc["big3_pct_out"] * 100.0).round(3)
-                st.dataframe(conc, width="stretch", hide_index=True)
-            else:
-                st.caption("Big 3 concentration appears once %Out is present in latest rows.")
+    view = holdings_view.copy()
+    view = view.sort_values(["ticker", "value_usd"], ascending=[True, False])
+    view_ranked = view.groupby("ticker").head(topn)
 
-        with c1:
-            st.markdown("### Top holders (latest)")
+    st.markdown("### Top holders by company (value)")
+    st.dataframe(
+        view_ranked[
+            [
+                "ticker",
+                "manager_name",
+                "tags",
+                "shares",
+                "value_usd_m",
+                "shares_change",
+                "value_change_m",
+            ]
+        ],
+        width="stretch",
+        hide_index=True,
+    )
 
-            min_pct = st.slider("Minimum % Out (latest)", 0.0, 20.0, 0.0, 0.25)
-            tag_filter = st.multiselect(
-                "Filter by tag",
-                options=sorted(
-                    {
-                        t
-                        for ts in latest["tags"].dropna().tolist()
-                        for t in [x.strip() for x in ts.split(",") if x.strip()]
-                    }
-                ),
-                default=[],
-            )
+    st.markdown("### Big 3 concentration (by manager name tags)")
+    big3 = view[view["tags"].str.contains("Vanguard|BlackRock|State Street", regex=True, na=False)].copy()
+    if big3.empty:
+        st.caption("No Big 3 managers matched via tag rules in the current filtered view.")
+    else:
+        conc = big3.groupby("ticker")[["value_usd"]].sum().reset_index()
+        conc["big3_value_usd_m"] = (conc["value_usd"] / 1_000_000.0).round(2)
+        st.dataframe(conc[["ticker", "big3_value_usd_m"]], width="stretch", hide_index=True)
 
-            view = latest.copy()
-            if "pct_out" in view.columns and view["pct_out"].notna().any():
-                view = view[(view["pct_out"].fillna(0) * 100.0) >= min_pct]
-            if tag_filter:
-                view = view[
-                    view["holder"].apply(
-                        lambda x: any(t in apply_tags(x, tag_rules) for t in tag_filter)
-                    )
-                ]
+    st.markdown("### Concentration chart (Top holders value, per company)")
+    chart_df = view_ranked.pivot_table(index="manager_name", columns="ticker", values="value_usd_m", aggfunc="sum").fillna(0)
+    st.bar_chart(chart_df, width="stretch")
 
-            view = view.sort_values(["ticker", "pct_out"], ascending=[True, False])
-            st.dataframe(
-                view[
-                    [
-                        "asof_utc",
-                        "ticker",
-                        "table_name",
-                        "holder",
-                        "tags",
-                        "shares",
-                        "reported_date",
-                        "pct_out_display",
-                        "value_usd",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-
-        st.markdown("### Ownership concentration chart (latest)")
-        if "pct_out" in latest.columns and latest["pct_out"].notna().any():
-            chart_df = latest.dropna(subset=["pct_out"]).copy()
-            chart_df["pct_out_pct"] = chart_df["pct_out"] * 100.0
-            N = st.selectbox("Top N holders per company", [5, 10, 15, 25], index=1)
-            chart_df = (
-                chart_df.sort_values(["ticker", "pct_out"], ascending=[True, False])
-                .groupby("ticker")
-                .head(N)
-            )
-            st.bar_chart(
-                data=chart_df.pivot_table(
-                    index="holder", columns="ticker", values="pct_out_pct", aggfunc="max"
-                ).fillna(0),
-                width="stretch",
-            )
-        else:
-            st.caption("Percent-out chart will appear once % Out is available.")
 
 # -----------------------------
-# Company Detail
+# Company detail tab
 # -----------------------------
 with tab_company:
-    st.subheader("Company Detail — snapshot history")
+    st.subheader("Company Detail — trends across quarters")
 
     ticker = st.selectbox("Choose a company", options=selected_tickers, index=0)
-    hist = load_history(conn, ticker)
+    company_cur = holdings_cur[holdings_cur["ticker"] == ticker].copy()
+    company_cur["tags"] = company_cur["manager_name"].apply(lambda x: ", ".join(apply_tags(str(x), tag_rules)))
+    company_cur["value_usd_m"] = (company_cur["value_usd"] / 1_000_000.0).round(2)
+    if "value_change" in company_cur.columns:
+        company_cur["value_change_m"] = (company_cur["value_change"] / 1_000_000.0).round(2)
 
-    if hist.empty:
-        st.info("No history for this ticker yet. Click **Refresh Now**.")
+    st.markdown("### Current quarter top holders (by value)")
+    company_top = company_cur.sort_values("value_usd", ascending=False).head(30)
+    st.dataframe(
+        company_top[["manager_name", "tags", "shares", "value_usd_m", "shares_change", "value_change_m"]],
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.markdown("### Trend (value) for selected managers across loaded quarters")
+    # Build history for this ticker across all quarters loaded
+    hist = pd.read_sql_query(
+        """
+        SELECT quarter_end, ticker, manager_name, shares, value_usd
+        FROM holdings_13f
+        WHERE ticker = ?
+        """,
+        conn,
+        params=[ticker],
+    )
+    hist["value_usd_m"] = hist["value_usd"] / 1_000_000.0
+    managers = sorted(hist["manager_name"].dropna().unique().tolist())
+
+    default_watch = [m for m in managers if re.search(r"Vanguard|BlackRock|State Street", m, re.IGNORECASE)]
+    watch = st.multiselect("Pick managers to trend", options=managers, default=default_watch[:8] if default_watch else managers[:8])
+
+    trend = hist[hist["manager_name"].isin(watch)].copy()
+    if trend.empty:
+        st.caption("Pick at least one manager.")
     else:
-        hist["tags"] = hist["holder"].apply(lambda x: ", ".join(apply_tags(x, tag_rules)))
-        hist["pct_out_display"] = (hist["pct_out"] * 100.0).round(3)
+        pivot = trend.pivot_table(index="quarter_end", columns="manager_name", values="value_usd_m", aggfunc="sum").sort_index()
+        st.line_chart(pivot, width="stretch")
 
-        st.markdown("### Latest for this company")
-        latest_asof = hist["asof_utc"].max()
-        latest_rows = hist[hist["asof_utc"] == latest_asof].sort_values("pct_out", ascending=False)
 
+# -----------------------------
+# Manager view tab
+# -----------------------------
+with tab_manager:
+    st.subheader("Manager View — holdings across your selected universe")
+
+    if manager_choice == "All managers":
+        st.info("Use the sidebar Manager Selector to pick a specific manager to view cross-company holdings.")
+    else:
+        inv = holdings_cur[holdings_cur["manager_name"] == manager_choice].copy()
+        inv["value_usd_m"] = (inv["value_usd"] / 1_000_000.0).round(2)
+        if "value_change" in inv.columns:
+            inv["value_change_m"] = (inv["value_change"] / 1_000_000.0).round(2)
+
+        st.markdown(f"### {manager_choice} — quarter {quarter_end}")
         st.dataframe(
-            latest_rows[
-                ["asof_utc", "table_name", "holder", "tags", "shares", "reported_date", "pct_out_display", "value_usd"]
-            ],
+            inv[["ticker", "shares", "value_usd_m", "shares_change", "value_change_m"]],
             width="stretch",
             hide_index=True,
         )
 
-        st.markdown("### Change over time (holder-level)")
-        holders = sorted(hist["holder"].dropna().unique().tolist())
-        default_watch = [h for h in holders if re.search(r"Vanguard|BlackRock|State Street", h, re.IGNORECASE)]
-        watch = st.multiselect("Trend these holders", options=holders, default=default_watch[:10])
-
-        trend = hist[hist["holder"].isin(watch)].copy()
-        if trend.empty:
-            st.caption("Select one or more holders to trend.")
-        else:
-            trend["asof_dt"] = pd.to_datetime(trend["asof_utc"])
-            trend = trend.sort_values("asof_dt")
-
-            if trend["pct_out"].notna().any():
-                pivot = trend.pivot_table(index="asof_dt", columns="holder", values="pct_out", aggfunc="max") * 100.0
-                st.line_chart(pivot, width="stretch")
-            else:
-                pivot = trend.pivot_table(index="asof_dt", columns="holder", values="shares", aggfunc="max")
-                st.line_chart(pivot, width="stretch")
 
 # -----------------------------
-# Investor View
-# -----------------------------
-with tab_investor:
-    st.subheader("Investor View — across companies")
-
-    latest = load_latest_detail(conn, selected_tickers)
-    if latest.empty:
-        st.info("No data yet. Click **Refresh Now**.")
-    else:
-        latest["tags"] = latest["holder"].apply(lambda x: ", ".join(apply_tags(x, tag_rules)))
-        holder_list = sorted(latest["holder"].dropna().unique().tolist())
-
-        investor = st.selectbox(
-            "Choose an investor / institution",
-            options=holder_list,
-            index=0 if holder_list else None,
-        )
-
-        inv_df = latest[latest["holder"] == investor].copy()
-        inv_df["pct_out_display"] = (inv_df["pct_out"] * 100.0).round(3)
-
-        st.markdown(f"### {investor}")
-        st.dataframe(
-            inv_df[["asof_utc", "ticker", "table_name", "shares", "reported_date", "pct_out_display", "value_usd", "tags"]],
-            width="stretch",
-            hide_index=True,
-        )
-
-        st.markdown("### Simple narrative cue")
-        if inv_df["pct_out"].notna().any():
-            tot = (inv_df["pct_out"].fillna(0).sum() * 100.0)
-            st.write(
-                f"Across the selected universe, this holder accounts for ~**{tot:.3f}%** combined %Out "
-                f"(sum of per-company %Out across the latest snapshot)."
-            )
-        else:
-            st.caption("Percent-out not available in latest rows; showing shares/value instead.")
-
-# -----------------------------
-# Data / Exports
+# Data / Exports tab
 # -----------------------------
 with tab_data:
     st.subheader("Data management & exports")
 
-    meta_df = pd.read_sql_query(
-        "SELECT snapshot_id, asof_utc, ticker, source, fetch_ok, error FROM snapshot_meta ORDER BY asof_utc DESC LIMIT 200",
-        conn,
-    )
-    st.markdown("### Recent snapshots")
-    st.dataframe(meta_df, width="stretch", hide_index=True)
+    st.markdown("### Loaded quarters")
+    st.dataframe(loaded, width="stretch", hide_index=True)
 
-    st.markdown("### Recent fetch errors (if any)")
+    st.markdown("### Export current quarter view (CSV)")
+    export_df = holdings_view.copy()
+    csv = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download 13F_current_quarter_view.csv",
+        data=csv,
+        file_name="13F_current_quarter_view.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("### Export top holders per company (CSV)")
+    topn2 = 25
+    top_df = (
+        holdings_view.sort_values(["ticker", "value_usd"], ascending=[True, False])
+        .groupby("ticker")
+        .head(topn2)
+        .copy()
+    )
+    top_csv = top_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        f"Download top_{topn2}_holders_per_company.csv",
+        data=top_csv,
+        file_name=f"top_{topn2}_holders_per_company.csv",
+        mime="text/csv",
+    )
+
+
+# -----------------------------
+# Debug tab
+# -----------------------------
+with tab_debug:
+    st.subheader("Debug / Diagnostics")
+
+    st.markdown("### What the pipeline is doing")
+    st.write(
+        {
+            "quarter_end_selected": quarter_end,
+            "prior_quarter_end": prior_q,
+            "selected_tickers": selected_tickers,
+            "ticker_to_cusip": {t: TICKER_TO_CUSIP.get(t) for t in selected_tickers},
+            "manager_filter": manager_choice,
+            "rows_in_view": int(len(holdings_view)),
+        }
+    )
+
+    st.markdown("### Recent ingestion errors (if any)")
     err_df = pd.read_sql_query(
         """
-        SELECT asof_utc, ticker, source, error
-        FROM snapshot_meta
-        WHERE fetch_ok = 0 AND error IS NOT NULL
+        SELECT quarter_label, quarter_end, asof_utc, zip_url, error
+        FROM quarter_meta
+        WHERE ingest_ok = 0 AND error IS NOT NULL
         ORDER BY asof_utc DESC
-        LIMIT 50
+        LIMIT 25
         """,
         conn,
     )
     st.dataframe(err_df, width="stretch", hide_index=True)
 
-    st.markdown("### Export latest holders as CSV")
-    latest = load_latest_detail(conn, selected_tickers)
-    if latest.empty:
-        st.caption("Nothing to export yet.")
-    else:
-        latest["tags"] = latest["holder"].apply(lambda x: ", ".join(apply_tags(x, tag_rules)))
-        csv = latest.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download latest_holders.csv",
-            data=csv,
-            file_name="latest_holders.csv",
-            mime="text/csv",
-        )
-
-    if show_raw:
-        st.markdown("### Raw holder_rows (most recent 200)")
-        raw = pd.read_sql_query(
-            """
-            SELECT r.row_id, m.asof_utc, r.ticker, r.table_name, r.holder, r.shares, r.reported_date, r.pct_out, r.value_usd
-            FROM holder_rows r
-            JOIN snapshot_meta m ON m.snapshot_id = r.snapshot_id
-            ORDER BY r.row_id DESC
-            LIMIT 200
-            """,
-            conn,
-        )
-        st.dataframe(raw, width="stretch", hide_index=True)
-
-# -----------------------------
-# Debug (helps you see what Yahoo is returning)
-# -----------------------------
-with tab_debug:
-    st.subheader("Connectivity diagnostics")
-    st.caption("Use this to see whether quoteSummary is reachable from Streamlit Cloud and what errors you’re getting.")
-
-    test_ticker = st.selectbox("Test ticker", options=selected_tickers, index=0)
-    cookie_header, crumb = get_yahoo_session_and_crumb()
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### quoteSummary (no cookie)")
-        status, err, tables = fetch_quote_summary(test_ticker, cookie_header=None)
-        st.write({"status": status, "error": err, "tables": list(tables.keys())})
-
-    with c2:
-        st.markdown("### quoteSummary (cookie/crumb)")
-        status2, err2, tables2 = fetch_quote_summary(test_ticker, cookie_header=cookie_header)
-        st.write({"status": status2, "error": err2, "tables": list(tables2.keys()), "crumb_present": bool(crumb)})
-
-    st.markdown("### HTML holders (cookie/crumb) — last resort")
-    status3, err3, tables3 = fetch_holders_html(test_ticker, cookie_header=cookie_header)
-    st.write({"status": status3, "error": err3, "tables": list(tables3.keys())})
-
-st.caption("Tip: schedule periodic runs (cron/GitHub Actions) to refresh and build a long ownership history.")
+st.caption(
+    "Note: SEC Form 13F is quarterly and may lag filings. "
+    "For best results, ingest multiple quarters and use the Company/Manager trend views."
+)
