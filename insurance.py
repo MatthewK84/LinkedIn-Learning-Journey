@@ -12,18 +12,16 @@ import streamlit as st
 # Config
 # -----------------------------
 DEFAULT_COMPANIES = {
-    # "Big 3" health insurers (default set; you can add/remove)
+    # Big 3 insurers (by enrollment; also among largest by market cap)
     "UnitedHealth Group": "UNH",
     "Elevance Health": "ELV",
-    "The Cigna Group": "CI",
-
-    # "Big 3" drug wholesalers
+    "CVS Health (Aetna)": "CVS",
+    # Big 3 drug wholesalers
     "McKesson": "MCK",
     "Cencora": "COR",
     "Cardinal Health": "CAH",
 }
 
-# Tags you mentioned + a few useful categories.
 DEFAULT_TAG_RULES = [
     ("Vanguard", r"\bVanguard\b"),
     ("BlackRock", r"\bBlackRock\b|\bBlackrock\b"),
@@ -51,11 +49,12 @@ USER_AGENT = (
 # -----------------------------
 @dataclass
 class SnapshotMeta:
-    asof_utc: str          # snapshot time
+    asof_utc: str
     ticker: str
-    source: str           # e.g. "yahoo_finance"
-    fetch_ok: int         # 1/0
+    source: str
+    fetch_ok: int
     error: Optional[str] = None
+
 
 # -----------------------------
 # DB helpers
@@ -65,6 +64,7 @@ def db_connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
 
 def db_init(conn: sqlite3.Connection) -> None:
     conn.executescript(
@@ -82,7 +82,7 @@ def db_init(conn: sqlite3.Connection) -> None:
             row_id INTEGER PRIMARY KEY AUTOINCREMENT,
             snapshot_id INTEGER NOT NULL,
             ticker TEXT NOT NULL,
-            table_name TEXT NOT NULL,              -- e.g. "Top Institutional Holders"
+            table_name TEXT NOT NULL,
             holder TEXT,
             shares REAL,
             reported_date TEXT,
@@ -101,6 +101,7 @@ def db_init(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
+
 # -----------------------------
 # Parsing utilities
 # -----------------------------
@@ -110,15 +111,12 @@ def _to_number(x) -> Optional[float]:
     s = str(x).strip()
     if s in ("", "—", "-", "N/A", "nan"):
         return None
-    # remove commas
     s = s.replace(",", "")
-    # handle percents
     if s.endswith("%"):
         try:
             return float(s[:-1]) / 100.0
         except Exception:
             return None
-    # handle suffixes like 1.2B / 300M / 20K
     m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMBT])?$", s, re.IGNORECASE)
     if m:
         val = float(m.group(1))
@@ -130,10 +128,12 @@ def _to_number(x) -> Optional[float]:
     except Exception:
         return None
 
+
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
 
 def apply_tags(holder_name: str, custom_rules: List[Tuple[str, str]]) -> List[str]:
     tags = []
@@ -144,43 +144,62 @@ def apply_tags(holder_name: str, custom_rules: List[Tuple[str, str]]) -> List[st
             tags.append(tag)
     return tags
 
+
 # -----------------------------
 # Yahoo fetcher
 # -----------------------------
-@st.cache_data(show_spinner=False, ttl=60 * 60)  # cache 1 hour
+@st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_yahoo_holders_tables(ticker: str) -> Tuple[SnapshotMeta, Dict[str, pd.DataFrame]]:
     url = YAHOO_HOLDERS_URL.format(ticker=ticker)
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
     asof = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
+        r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+        status = r.status_code
+        if status != 200:
+            meta = SnapshotMeta(
+                asof_utc=asof,
+                ticker=ticker,
+                source="yahoo_finance",
+                fetch_ok=0,
+                error=f"HTTP {status} fetching {url}",
+            )
+            return meta, {}
+
         html = r.text
-
-        # Yahoo holders pages typically contain multiple tables.
-        # We’ll pull them via read_html and then identify by column patterns.
         tables = pd.read_html(html)
-        out: Dict[str, pd.DataFrame] = {}
+        if not tables:
+            meta = SnapshotMeta(
+                asof_utc=asof,
+                ticker=ticker,
+                source="yahoo_finance",
+                fetch_ok=0,
+                error="No HTML tables found (possible bot/consent page).",
+            )
+            return meta, {}
 
+        out: Dict[str, pd.DataFrame] = {}
         for t in tables:
             t = _clean_columns(t)
-
             cols = set([c.lower() for c in t.columns])
-            # "Major Holders" has two columns like "Breakdown", "Value"
+
             if len(t.columns) == 2 and ("breakdown" in cols or "value" in cols):
                 out.setdefault("Major Holders", t)
 
-            # Institutional holders table usually includes: Holder, Shares, Date Reported, % Out, Value
             if {"holder", "shares", "date reported"}.issubset(cols):
-                if "% out" in cols or "value" in cols:
-                    # heuristic: institutional holders table tends to be larger and appears first
-                    # We’ll label by whether it looks like "institutional" vs "mutual fund" later if needed.
-                    out.setdefault("Top Holders (Detail)", t)
+                out.setdefault("Top Holders (Detail)", t)
 
-        # Yahoo often provides both "Top Institutional Holders" and "Top Mutual Fund Holders".
-        # read_html can merge them; we split using row density + presence of fund-like names as best-effort.
-        # If we can’t split confidently, we keep a single detail table.
+        if not out:
+            meta = SnapshotMeta(
+                asof_utc=asof,
+                ticker=ticker,
+                source="yahoo_finance",
+                fetch_ok=0,
+                error="Tables found, but none matched expected holder schemas.",
+            )
+            return meta, {}
+
         meta = SnapshotMeta(asof_utc=asof, ticker=ticker, source="yahoo_finance", fetch_ok=1)
         return meta, out
 
@@ -188,13 +207,9 @@ def fetch_yahoo_holders_tables(ticker: str) -> Tuple[SnapshotMeta, Dict[str, pd.
         meta = SnapshotMeta(asof_utc=asof, ticker=ticker, source="yahoo_finance", fetch_ok=0, error=str(e))
         return meta, {}
 
+
 def normalize_detail_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize to canonical columns:
-    holder, shares, reported_date, pct_out, value_usd
-    """
     df = df.copy()
-    # Standardize column names
     rename_map = {}
     for c in df.columns:
         cl = c.lower().strip()
@@ -210,22 +225,21 @@ def normalize_detail_table(df: pd.DataFrame) -> pd.DataFrame:
             rename_map[c] = "value_usd"
     df = df.rename(columns=rename_map)
 
-    # Keep only canonical columns (if present)
     keep = [c for c in ["holder", "shares", "reported_date", "pct_out", "value_usd"] if c in df.columns]
     df = df[keep].copy()
 
     if "shares" in df.columns:
         df["shares"] = df["shares"].apply(_to_number)
     if "pct_out" in df.columns:
-        df["pct_out"] = df["pct_out"].apply(_to_number)  # already converted to decimal
+        df["pct_out"] = df["pct_out"].apply(_to_number)
     if "value_usd" in df.columns:
         df["value_usd"] = df["value_usd"].apply(_to_number)
 
-    # Normalize reported_date to YYYY-MM-DD if possible (Yahoo often shows "Dec 31, 2025")
     if "reported_date" in df.columns:
         df["reported_date"] = pd.to_datetime(df["reported_date"], errors="coerce").dt.date.astype(str)
 
     return df
+
 
 # -----------------------------
 # Persistence
@@ -246,7 +260,6 @@ def persist_snapshot(conn: sqlite3.Connection, meta: SnapshotMeta, tables: Dict[
         else:
             df_n = df.copy()
 
-        # insert row-by-row
         for _, row in df_n.iterrows():
             holder = row.get("holder") if isinstance(row, pd.Series) else None
             shares = row.get("shares") if isinstance(row, pd.Series) else None
@@ -265,16 +278,23 @@ def persist_snapshot(conn: sqlite3.Connection, meta: SnapshotMeta, tables: Dict[
                     meta.ticker,
                     table_name,
                     None if pd.isna(holder) else str(holder),
-                    None if (shares is None or (isinstance(shares, float) and pd.isna(shares))) else float(shares),
+                    None
+                    if (shares is None or (isinstance(shares, float) and pd.isna(shares)))
+                    else float(shares),
                     None if (reported_date is None or reported_date == "NaT") else str(reported_date),
-                    None if (pct_out is None or (isinstance(pct_out, float) and pd.isna(pct_out))) else float(pct_out),
-                    None if (value_usd is None or (isinstance(value_usd, float) and pd.isna(value_usd))) else float(value_usd),
+                    None
+                    if (pct_out is None or (isinstance(pct_out, float) and pd.isna(pct_out)))
+                    else float(pct_out),
+                    None
+                    if (value_usd is None or (isinstance(value_usd, float) and pd.isna(value_usd)))
+                    else float(value_usd),
                     None,
                 ),
             )
 
     conn.commit()
     return snapshot_id
+
 
 def load_latest_detail(conn: sqlite3.Connection, tickers: List[str]) -> pd.DataFrame:
     q = """
@@ -294,6 +314,7 @@ def load_latest_detail(conn: sqlite3.Connection, tickers: List[str]) -> pd.DataF
     """.format(",".join(["?"] * len(tickers)))
     return pd.read_sql_query(q, conn, params=tickers)
 
+
 def load_history(conn: sqlite3.Connection, ticker: str) -> pd.DataFrame:
     q = """
     SELECT m.asof_utc, r.ticker, r.holder, r.shares, r.reported_date, r.pct_out, r.value_usd
@@ -306,6 +327,7 @@ def load_history(conn: sqlite3.Connection, ticker: str) -> pd.DataFrame:
     ORDER BY m.asof_utc ASC
     """
     return pd.read_sql_query(q, conn, params=[ticker])
+
 
 # -----------------------------
 # UI
@@ -331,7 +353,6 @@ Data source: Yahoo Finance “Holders” pages (e.g., UNH/holders). Reporting of
         """
     )
 
-# Sidebar: configuration
 st.sidebar.header("Controls")
 
 db_path = st.sidebar.text_input("SQLite DB Path", DB_PATH_DEFAULT)
@@ -368,14 +389,19 @@ if do_refresh:
             persist_snapshot(conn, meta, tables)
     st.success("Refresh complete. Snapshots saved.")
 
-# Tabs
+# Auto-refresh once per session if DB is empty
+if "auto_refreshed" not in st.session_state:
+    cnt = pd.read_sql_query("SELECT COUNT(*) AS n FROM snapshot_meta", conn)["n"].iloc[0]
+    if cnt == 0:
+        for t in selected_tickers:
+            meta, tables = fetch_yahoo_holders_tables(t)
+            persist_snapshot(conn, meta, tables)
+    st.session_state["auto_refreshed"] = True
+
 tab_overview, tab_company, tab_investor, tab_data = st.tabs(
     ["Overview", "Company Detail", "Investor View", "Data / Exports"]
 )
 
-# -----------------------------
-# Overview
-# -----------------------------
 with tab_overview:
     st.subheader("Latest snapshot — cross-company view")
 
@@ -390,8 +416,9 @@ with tab_overview:
 
         with c2:
             st.markdown("### Concentration quick check")
-            # Share of %Out for the big 3 managers, by ticker
-            big3 = latest[latest["tags"].str.contains("Vanguard|BlackRock|State Street", regex=True, na=False)].copy()
+            big3 = latest[
+                latest["tags"].str.contains("Vanguard|BlackRock|State Street", regex=True, na=False)
+            ].copy()
             if not big3.empty and "pct_out" in big3.columns:
                 conc = (
                     big3.groupby("ticker")["pct_out"]
@@ -400,18 +427,23 @@ with tab_overview:
                     .rename(columns={"pct_out": "big3_pct_out"})
                 )
                 conc["big3_pct_out"] = (conc["big3_pct_out"] * 100.0).round(2)
-                st.dataframe(conc, use_container_width=True)
+                st.dataframe(conc, width="stretch", hide_index=True)
             else:
                 st.caption("Big 3 concentration will appear once % Out is available in the latest tables.")
 
         with c1:
             st.markdown("### Top holders (latest)")
 
-            # filter controls
             min_pct = st.slider("Minimum % Out (latest)", 0.0, 20.0, 0.0, 0.25)
             tag_filter = st.multiselect(
                 "Filter by tag",
-                options=sorted({t for ts in latest["tags"].dropna().tolist() for t in [x.strip() for x in ts.split(",") if x.strip()]}),
+                options=sorted(
+                    {
+                        t
+                        for ts in latest["tags"].dropna().tolist()
+                        for t in [x.strip() for x in ts.split(",") if x.strip()]
+                    }
+                ),
                 default=[],
             )
 
@@ -419,12 +451,27 @@ with tab_overview:
             if "pct_out" in view.columns:
                 view = view[(view["pct_out"].fillna(0) * 100.0) >= min_pct]
             if tag_filter:
-                view = view[view["holder"].apply(lambda x: any(t in apply_tags(x, tag_rules) for t in tag_filter))]
+                view = view[
+                    view["holder"].apply(
+                        lambda x: any(t in apply_tags(x, tag_rules) for t in tag_filter)
+                    )
+                ]
 
             view = view.sort_values(["ticker", "pct_out"], ascending=[True, False])
             st.dataframe(
-                view[["asof_utc", "ticker", "holder", "tags", "shares", "reported_date", "pct_out_display", "value_usd"]],
-                use_container_width=True,
+                view[
+                    [
+                        "asof_utc",
+                        "ticker",
+                        "holder",
+                        "tags",
+                        "shares",
+                        "reported_date",
+                        "pct_out_display",
+                        "value_usd",
+                    ]
+                ],
+                width="stretch",
                 hide_index=True,
             )
 
@@ -432,20 +479,22 @@ with tab_overview:
         if "pct_out" in latest.columns and latest["pct_out"].notna().any():
             chart_df = latest.dropna(subset=["pct_out"]).copy()
             chart_df["pct_out_pct"] = chart_df["pct_out"] * 100.0
-            # Top N per ticker to keep clean
             N = st.selectbox("Top N holders per company", [5, 10, 15, 25], index=1)
-            chart_df = chart_df.sort_values(["ticker", "pct_out"], ascending=[True, False]).groupby("ticker").head(N)
+            chart_df = (
+                chart_df.sort_values(["ticker", "pct_out"], ascending=[True, False])
+                .groupby("ticker")
+                .head(N)
+            )
 
             st.bar_chart(
-                data=chart_df.pivot_table(index="holder", columns="ticker", values="pct_out_pct", aggfunc="max").fillna(0),
-                use_container_width=True,
+                data=chart_df.pivot_table(
+                    index="holder", columns="ticker", values="pct_out_pct", aggfunc="max"
+                ).fillna(0),
+                width="stretch",
             )
         else:
             st.caption("Percent-out chart will appear once % Out is available.")
 
-# -----------------------------
-# Company Detail
-# -----------------------------
 with tab_company:
     st.subheader("Company Detail — snapshot history")
 
@@ -463,13 +512,14 @@ with tab_company:
         latest_rows = hist[hist["asof_utc"] == latest_asof].sort_values("pct_out", ascending=False)
 
         st.dataframe(
-            latest_rows[["asof_utc", "holder", "tags", "shares", "reported_date", "pct_out_display", "value_usd"]],
-            use_container_width=True,
+            latest_rows[
+                ["asof_utc", "holder", "tags", "shares", "reported_date", "pct_out_display", "value_usd"]
+            ],
+            width="stretch",
             hide_index=True,
         )
 
         st.markdown("### Change over time (holder-level)")
-        # pick a few holders to trend
         holders = sorted(hist["holder"].dropna().unique().tolist())
         default_watch = [h for h in holders if re.search(r"Vanguard|BlackRock|State Street", h, re.IGNORECASE)]
         watch = st.multiselect("Trend these holders", options=holders, default=default_watch[:10])
@@ -480,17 +530,13 @@ with tab_company:
         else:
             trend["asof_dt"] = pd.to_datetime(trend["asof_utc"])
             trend = trend.sort_values("asof_dt")
-            # plot with Streamlit native line chart
             if "pct_out" in trend.columns and trend["pct_out"].notna().any():
                 pivot = trend.pivot_table(index="asof_dt", columns="holder", values="pct_out", aggfunc="max") * 100.0
-                st.line_chart(pivot, use_container_width=True)
+                st.line_chart(pivot, width="stretch")
             else:
                 pivot = trend.pivot_table(index="asof_dt", columns="holder", values="shares", aggfunc="max")
-                st.line_chart(pivot, use_container_width=True)
+                st.line_chart(pivot, width="stretch")
 
-# -----------------------------
-# Investor View
-# -----------------------------
 with tab_investor:
     st.subheader("Investor View — across companies")
 
@@ -513,30 +559,41 @@ with tab_investor:
         st.markdown(f"### {investor}")
         st.dataframe(
             inv_df[["asof_utc", "ticker", "shares", "reported_date", "pct_out_display", "value_usd", "tags"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
         st.markdown("### Simple narrative cue")
         if inv_df["pct_out"].notna().any():
             tot = (inv_df["pct_out"].fillna(0).sum() * 100.0)
-            st.write(f"Across the selected universe, this holder accounts for ~**{tot:.2f}%** combined %Out (sum of per-company %Out).")
+            st.write(
+                f"Across the selected universe, this holder accounts for ~**{tot:.2f}%** combined %Out (sum of per-company %Out)."
+            )
         else:
             st.caption("Percent-out not available in latest rows; showing shares/value instead.")
 
-# -----------------------------
-# Data / Exports
-# -----------------------------
 with tab_data:
     st.subheader("Data management & exports")
 
-    # Snapshot table
     meta_df = pd.read_sql_query(
         "SELECT snapshot_id, asof_utc, ticker, source, fetch_ok, error FROM snapshot_meta ORDER BY asof_utc DESC LIMIT 200",
         conn,
     )
     st.markdown("### Recent snapshots")
-    st.dataframe(meta_df, use_container_width=True, hide_index=True)
+    st.dataframe(meta_df, width="stretch", hide_index=True)
+
+    st.markdown("### Recent fetch errors (if any)")
+    err_df = pd.read_sql_query(
+        """
+        SELECT asof_utc, ticker, error
+        FROM snapshot_meta
+        WHERE fetch_ok = 0 AND error IS NOT NULL
+        ORDER BY asof_utc DESC
+        LIMIT 50
+        """,
+        conn,
+    )
+    st.dataframe(err_df, width="stretch", hide_index=True)
 
     st.markdown("### Export latest holders as CSV")
     latest = load_latest_detail(conn, selected_tickers)
@@ -545,7 +602,9 @@ with tab_data:
     else:
         latest["tags"] = latest["holder"].apply(lambda x: ", ".join(apply_tags(x, tag_rules)))
         csv = latest.to_csv(index=False).encode("utf-8")
-        st.download_button("Download latest_holders.csv", data=csv, file_name="latest_holders.csv", mime="text/csv")
+        st.download_button(
+            "Download latest_holders.csv", data=csv, file_name="latest_holders.csv", mime="text/csv"
+        )
 
     if show_raw:
         st.markdown("### Raw holder_rows (most recent 200)")
@@ -559,6 +618,6 @@ with tab_data:
             """,
             conn,
         )
-        st.dataframe(raw, use_container_width=True, hide_index=True)
+        st.dataframe(raw, width="stretch", hide_index=True)
 
 st.caption("Tip: schedule periodic runs (cron/GitHub Actions) to refresh and build a long ownership history.")
