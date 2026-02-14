@@ -466,7 +466,7 @@ def compute_changes_since_prior(conn: sqlite3.Connection, quarter_end: str, tick
 # ============================================================
 
 st.set_page_config(page_title="SEC 13F Ownership Tracker (Data.gov)", layout="wide")
-st.title("Institutional Ownership Tracker — SEC 13F (Data.gov index, no Yahoo)")
+st.title("Big 3 Health Insurers Institutional Ownership Tracker")
 st.caption(
     "Discovers SEC Form 13F dataset ZIPs via Data.gov, ingests holdings from ZIP TSVs, "
     "and provides Quarter Selector, Manager Selector, and Change Since Last Quarter."
